@@ -30,15 +30,8 @@ from lm_eval import utils
 from lm_eval.api.instance import Instance
 from lm_eval.api.model import TemplateLM
 from lm_eval.api.registry import register_model
-from lm_eval.models.utils import (
-    Collator,
-    clear_torch_cache,
-    configure_pad_token,
-    get_dtype,
-    handle_stop_sequences,
-    pad_and_concat,
-    stop_sequences_criteria,
-)
+from lm_eval.models.utils import configure_pad_token
+from eval_model.lm_eval_compat import get_dtype
 
 eval_logger = logging.getLogger(__name__)
 from utils import  generate
@@ -772,6 +765,8 @@ class LLaDA(TemplateLM):
         ds = [{"text": req.args[0]} for req in requests]
         ds = Dataset.from_list(ds)
         gen_kwargs = requests[0].args[1]
+        gen_length = int(gen_kwargs.get("gen_length"))
+        left_truncate_len = max(1, self.max_length - gen_length)
         for batch in ds.iter(self.batch_size):
             contexts = batch["text"]
             if self.add_bos_token:
@@ -779,13 +774,14 @@ class LLaDA(TemplateLM):
             context_enc, attn_masks = self.tok_batch_encode(
                 contexts,
                 truncation=self.truncation,
+                left_truncate_len=left_truncate_len,
             )
             out = generate(
                 input_ids=context_enc,
                 attention_mask=attn_masks,
                 model=self.model,
                 steps=gen_kwargs.get("steps"),
-                gen_length=gen_kwargs.get("gen_length"),
+                gen_length=gen_length,
                 block_length=gen_kwargs.get("block_length"),
                 cfg_scale=gen_kwargs.get("cfg_scale"),
                 remasking=gen_kwargs.get("remasking",None) if gen_kwargs.get("remasking",None) else "low_confidence"

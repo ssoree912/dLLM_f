@@ -68,6 +68,7 @@ def generate(
 
             for i in range(steps_per_block):
                 mask_index = x == mask_id
+                feature_cache.set_mask_index(mask_index)
                 if cfg_scale > 0.0:
                     if hasattr(feature_cache, "cfg_interval_steps"):
                         feature_cache.update_step(layer_id=33)

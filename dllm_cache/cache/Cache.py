@@ -1,5 +1,7 @@
-import torch
+import os
 from collections import defaultdict
+
+import torch
 
 
 class Singleton(type):
@@ -17,8 +19,13 @@ class dLLMCache(metaclass=Singleton):
     cfg_interval_steps: int
     prompt_length: int
     transfer_ratio: float
+    maskkv_enabled: bool
+    maskkv_budget: int
+    maskkv_layer_base_rate: float
+    maskkv_head_base_rate: float
     __cache: defaultdict
     __step_counter: defaultdict
+    __mask_index: torch.Tensor | None
 
     @classmethod
     def new_instance(
@@ -33,6 +40,18 @@ class dLLMCache(metaclass=Singleton):
         setattr(ins, "gen_interval_steps", gen_interval_steps)
         setattr(ins, "cfg_interval_steps", cfg_interval_steps)
         setattr(ins, "transfer_ratio", transfer_ratio)
+        setattr(ins, "maskkv_enabled", os.getenv("MASKKV_ENABLED", "0") == "1")
+        setattr(ins, "maskkv_budget", int(os.getenv("MASKKV_BUDGET", "0")))
+        setattr(
+            ins,
+            "maskkv_layer_base_rate",
+            float(os.getenv("MASKKV_LAYER_BASE_RATE", "1.0")),
+        )
+        setattr(
+            ins,
+            "maskkv_head_base_rate",
+            float(os.getenv("MASKKV_HEAD_BASE_RATE", "1.0")),
+        )
         ins.init()
         return ins
 
@@ -41,12 +60,20 @@ class dLLMCache(metaclass=Singleton):
             lambda: defaultdict(lambda: defaultdict(lambda: defaultdict(dict)))
         )
         self.__step_counter = defaultdict(lambda: defaultdict(lambda: 0))
+        self.__mask_index = None
 
     def reset_cache(self, prompt_length: int = 0) -> None:
         self.init()
         torch.cuda.empty_cache()
         self.prompt_length = prompt_length
         self.cache_type = "no_cfg"
+        self.__mask_index = None
+
+    def set_mask_index(self, mask_index: torch.Tensor) -> None:
+        self.__mask_index = mask_index.detach()
+
+    def get_mask_index(self) -> torch.Tensor | None:
+        return self.__mask_index
 
     def set_cache(
         self, layer_id: int, feature_name: str, features: torch.Tensor, cache_type: str

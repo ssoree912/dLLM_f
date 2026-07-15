@@ -30,15 +30,7 @@ from lm_eval import utils
 from lm_eval.api.instance import Instance
 from lm_eval.api.model import TemplateLM
 from lm_eval.api.registry import register_model
-from lm_eval.models.utils import (
-    Collator,
-    clear_torch_cache,
-    configure_pad_token,
-    get_dtype,
-    handle_stop_sequences,
-    pad_and_concat,
-    stop_sequences_criteria,
-)
+from eval_model.lm_eval_compat import get_dtype
 
 eval_logger = logging.getLogger(__name__)
 from dllm_cache.cache import  dLLMCacheConfig,dLLMCache
@@ -358,4 +350,3 @@ class Dream(LM):
             pbar.update(len(contexts))
 
         return res
-

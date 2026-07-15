@@ -18,7 +18,7 @@ __pycache__/
 
 # C extensions
 *.so
-
+experiment/
 # Distribution / packaging
 .Python
 build/
@@ -195,4 +195,8 @@ cache_save/
 token_similarity_adjacent
 token
 results
+data/
+longbench_log/
+longbench_maskkv_log/
+longbench_smoke*/
 grid_images
