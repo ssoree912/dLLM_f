@@ -503,6 +503,22 @@ attention queries, prompt-token MLP, and prompt logits from each denoising step.
 It keeps suffix K/V dynamic and attends suffix queries to cached prompt K/V plus
 current suffix K/V.
 
+Decode latency check, first 20 2Wiki samples with precomputed prompt-KV:
+
+| Method | Samples | Budget | F1 | Mean decode | Mean total method | Score | Cache build | Decode peak delta |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Full-cache dLLM | 20 | full | 0.11723 | 6.6776s | 6.6776s | - | - | 1003.38 MiB |
+| Precomputed prompt-KV | 20 | 128 | 0.11576 | 0.9411s | 1.4239s | 0.2358s | 0.2386s | 72.00 MiB |
+
+Compared with full-cache dLLM, this is about `7.10x` faster for decode-only and
+`4.69x` faster including student scoring plus prompt-KV precompute. F1 is
+slightly lower by `0.00147` absolute on this 20-sample slice. The method-level
+peak remains dominated by the student scoring forward (`1077.55 MiB`), but the
+decode section itself drops from `1003.38 MiB` to `72.00 MiB`.
+
+The same run kept `6.52%` of prompt K/V on average and estimated a `91.98%`
+attention-QK element reduction.
+
 Smoke check, first 2Wiki sample with `max_length=512`, `gen_length=8`,
 `steps=8`, `budget=128`:
 
@@ -515,6 +531,198 @@ model is bidirectional, so full-sequence prompt hidden states can change when
 generated mask tokens are present. This implementation fixes prompt K/V from a
 prompt-only pass to test the cache hypothesis directly.
 
+Self-generated teacher run:
+
+```bash
+.venv/bin/python experiment/2026-07-14/revealed_answer/extract_self_teacher.py \
+  --output-root experiment/2026-07-14/results/self_generated_teacher_train_n200 \
+  --data /home/M2026107/dllm/data/train/2wikimultihopqa/2wikimultihopqa_train_longbench_format.jsonl \
+  --n-samples 200 \
+  --max-length 2048 \
+  --gen-length 32 \
+  --steps 32 \
+  --block-length 8 \
+  --device cuda:0 \
+  --dtype bfloat16
+
+.venv/bin/python experiment/2026-07-14/revealed_answer/train_student.py \
+  --teacher-root experiment/2026-07-14/results/self_generated_teacher_train_n200 \
+  --output-dir experiment/2026-07-14/results/self_generated_student_train_n200_topk128_e5_lr5e-5_tw0.02 \
+  --datasets 2wikimultihopqa_train \
+  --epochs 5 \
+  --lr 5e-5 \
+  --topk-weight 0.02 \
+  --topk-k 128 \
+  --device cuda:0 \
+  --dtype bfloat16
+```
+
+The teacher is built from origin LLaDA full-cache generated answers, not gold
+answers. For each train sample, origin LLaDA first generates an answer; that
+generated answer is appended to the prompt only for attention-score extraction.
+
+| Teacher | Train records | Epochs | Best val loss | 2Wiki eval samples | B | Prompt-KV F1 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| self-generated LLaDA answer | 200 | 5 | 0.36000 | 20 | 128 | 0.09155 |
+
+This first self-generated run is deliberately small. Its outputs look closer to
+origin LLaDA's verbose answer style, and it does not reproduce the gold-teacher
+prompt-KV F1 gain on the first 20 eval samples.
+
+Scale-up student training:
+
+```bash
+.venv/bin/python experiment/2026-07-14/revealed_answer/extract_self_teacher.py \
+  --output-root experiment/2026-07-14/results/self_generated_teacher_train_n1000 \
+  --data /home/M2026107/dllm/data/train/2wikimultihopqa/2wikimultihopqa_train_longbench_format.jsonl \
+  --n-samples 1000 \
+  --max-length 2048 \
+  --gen-length 32 \
+  --steps 32 \
+  --block-length 8 \
+  --device cuda:0 \
+  --dtype bfloat16
+
+.venv/bin/python experiment/2026-07-14/revealed_answer/train_student.py \
+  --teacher-root experiment/2026-07-14/results/self_generated_teacher_train_n1000 \
+  --output-dir experiment/2026-07-14/results/self_generated_student_train_n1000_topk128_e5_lr5e-5_tw0.02 \
+  --datasets 2wikimultihopqa_train \
+  --epochs 5 \
+  --lr 5e-5 \
+  --rank-weight 0.1 \
+  --topk-weight 0.02 \
+  --topk-k 128 \
+  --topk-positive-weight 8.0 \
+  --device cuda:0 \
+  --dtype bfloat16
+```
+
+The first 200 teacher records were copied from the n200 run, then the extractor
+resumed until the first 1000 train-split samples were present.
+
+| Teacher | Records | Split | Epochs | Best epoch | Best val loss | Final train loss | Final val loss |
+| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: |
+| self-generated LLaDA answer | 1000 | 900 train / 100 val | 5 | 4 | 0.34862 | 0.31058 | 0.35175 |
+
+Output files:
+
+- `experiment/2026-07-14/results/self_generated_teacher_train_n1000`
+- `experiment/2026-07-14/results/self_generated_student_train_n1000_topk128_e5_lr5e-5_tw0.02/checkpoint-best`
+- `experiment/2026-07-14/results/self_generated_student_train_n1000_topk128_e5_lr5e-5_tw0.02/checkpoint-last`
+- `experiment/2026-07-14/results/self_generated_student_n1000_topk128_e5_promptkv_b128_limit1`
+
+Checkpoint load smoke QA:
+
+| Check | Samples | Budget | F1 | Output |
+| --- | ---: | ---: | ---: | --- |
+| Prompt-KV eval with n1000 `checkpoint-best` | 1 | 128 | 0.25000 | `self_generated_student_n1000_topk128_e5_promptkv_b128_limit1` |
+
+Generation-time online teacher:
+
+The first self-generated extractor above is label-free, but it is still a
+2-pass hindsight teacher: LLaDA generates an answer, then the generated answer
+is appended to the prompt for a second attention extraction forward. That run
+was stopped while scaling toward n5000 after 3154 train records:
+
+| Output root | Records | Size | Role |
+| --- | ---: | ---: | --- |
+| `experiment/2026-07-14/results/self_generated_teacher_train_n5000` | 3154 | 473M | generated-answer hindsight baseline |
+
+For the main label-free self-distillation path, the extractor now records the
+attention used during generation itself. It first builds a static full-prompt
+K/V cache with `B=P`, then runs suffix-only denoising. At each denoising step it
+computes the actual suffix query attention over `[prompt cache, current suffix]`,
+slices the prompt columns, and accumulates only the suffix positions committed
+at that step:
+
+```text
+R[l, p] += sum_{i in C_t} mean_h softmax(Q^t_{l,h,i} K^t_{l,h,[P,S]}^T / sqrt(d))_p
+T[l, p] = R[l, p] / sum_{p'} R[l, p']
+```
+
+This avoids feeding the final output back as input, and it avoids gold-derived
+length metadata. Prompt truncation reserves the fixed generation length only:
+`prompt_cap = max_length - gen_length`.
+
+Online teacher extraction:
+
+```bash
+.venv/bin/python experiment/2026-07-14/revealed_answer/extract_online_self_teacher.py \
+  --output-root experiment/2026-07-14/results/online_self_generated_teacher_train_n5000 \
+  --data /home/M2026107/dllm/data/train/2wikimultihopqa/2wikimultihopqa_train_longbench_format.jsonl \
+  --n-samples 5000 \
+  --max-length 2048 \
+  --gen-length 32 \
+  --steps 32 \
+  --block-length 8 \
+  --device cuda:0 \
+  --dtype bfloat16
+```
+
+Smoke checks:
+
+| Check | Setting | Observed |
+| --- | --- | --- |
+| Short online teacher | `max_length=256`, `gen_length=8`, `steps=8`, `n=1` | `teacher_norm` shape `[32, 248]`, no gold `answer` field |
+| 2Wiki train online teacher | `max_length=2048`, `gen_length=32`, `steps=32`, `n=1` | `prompt=771`, `commits=32`, generated answer saved |
+
+Completed online-teacher train set:
+
+The n5000 online extraction completed after resumable restarts. Existing `.pt`
+records are skipped on restart, so interrupted runs continued from the next
+missing sample. The final teacher set is the main label-free generation-time
+teacher pool; the student training below still uses `--n-samples 1000` to keep
+that run comparable with the earlier n1000 runs.
+
+| Output root | Records | Size | Log |
+| --- | ---: | ---: | --- |
+| `experiment/2026-07-14/results/online_self_generated_teacher_train_n5000` | 5000 | 750M | `experiment/2026-07-14/logs/online_self_generated_teacher_train_n5000.log` |
+
+Final record sanity check:
+
+| Field | Observed |
+| --- | --- |
+| `teacher_kind` | `online_self_generated_prompt_kv` |
+| `teacher_graph` | `static_full_prompt_kv_B_equals_prompt_length` |
+| Example `teacher_raw` / `teacher_norm` shape | `[32, 771]` |
+| Example `commit_count` | 32 |
+| Example `teacher_norm.sum(-1)` | min 1.0 / max 1.0 |
+| Gold `answer` field | absent |
+
+```bash
+.venv/bin/python experiment/2026-07-14/revealed_answer/train_student.py \
+  --teacher-root experiment/2026-07-14/results/online_self_generated_teacher_train_n5000 \
+  --output-dir experiment/2026-07-14/results/online_self_generated_student_train_n1000_topk128_e5_lr5e-5_tw0.02 \
+  --datasets 2wikimultihopqa_train \
+  --n-samples 1000 \
+  --epochs 5 \
+  --lr 5e-5 \
+  --rank-weight 0.1 \
+  --topk-weight 0.02 \
+  --topk-k 128 \
+  --topk-positive-weight 8.0 \
+  --device cuda:0 \
+  --dtype bfloat16
+```
+
+| Teacher | Records on disk | Used records | Split | Epochs | Best epoch | Best val loss | Final train loss | Final val loss |
+| --- | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: |
+| online self-generated prompt-KV | 1941 | 1000 | 900 train / 100 val | 5 | 4 | 0.31599 | 0.28044 | 0.31770 |
+
+B=128 prompt-KV generation eval with `checkpoint-best`:
+
+```bash
+STUDENT_PATH=experiment/2026-07-14/results/online_self_generated_student_train_n1000_topk128_e5_lr5e-5_tw0.02/checkpoint-best \
+OUTPUT_DIR=experiment/2026-07-14/results/online_self_generated_student_n1000_topk128_e5_promptkv_b128_limit20 \
+LIMIT=20 \
+BUDGET=128 \
+bash experiment/2026-07-14/scripts/run_revealed_answer_student_prune_2wikimqa.sh
+```
+
+| Method | Eval samples | B | F1 | Elapsed |
+| --- | ---: | ---: | ---: | ---: |
+| online self-generated student, n1000, epoch-4 best | 20 | 128 | 0.05529 | 260.43s |
+
 Implementation files:
 
 - `experiment/2026-07-14/revealed_answer/extract_teacher.py`
@@ -523,11 +731,15 @@ Implementation files:
 - `experiment/2026-07-14/revealed_answer/train_student.py`
 - `experiment/2026-07-14/revealed_answer/training_loop.py`
 - `experiment/2026-07-14/revealed_answer/eval_student_imitation.py`
+- `experiment/2026-07-14/revealed_answer/extract_self_teacher.py`
+- `experiment/2026-07-14/revealed_answer/extract_online_self_teacher.py`
+- `experiment/2026-07-14/revealed_answer/full_prompt_kv_cache.py`
 - `experiment/2026-07-14/revealed_answer/imitation_metrics.py`
 - `experiment/2026-07-14/revealed_answer/measure_decode_latency_2wikimqa.py`
 - `experiment/2026-07-14/revealed_answer/oracle_prune.py`
 - `experiment/2026-07-14/revealed_answer/prompt_kv_cache.py`
 - `experiment/2026-07-14/revealed_answer/prompt_kv_forward.py`
 - `experiment/2026-07-14/revealed_answer/prompt_kv_generate.py`
+- `experiment/2026-07-14/revealed_answer/online_teacher.py`
 - `experiment/2026-07-14/revealed_answer/eval_teacher_oracle_2wikimqa.py`
 - `experiment/2026-07-14/revealed_answer/eval_student_prune_2wikimqa.py`

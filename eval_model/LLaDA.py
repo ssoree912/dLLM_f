@@ -1,5 +1,7 @@
 import logging
 import os
+import json
+import sys
 from datetime import timedelta
 from pathlib import Path
 from typing import Dict, List, Literal, Optional, Tuple, Union,Type,TypeVar
@@ -17,8 +19,12 @@ from datasets import Dataset
 from accelerate.utils import get_max_memory
 from huggingface_hub import HfApi
 from packaging import version
-from peft import PeftModel
-from peft import __version__ as PEFT_VERSION
+try:
+    from peft import PeftModel
+    from peft import __version__ as PEFT_VERSION
+except ModuleNotFoundError:
+    PeftModel = None
+    PEFT_VERSION = "0"
 from tqdm import tqdm
 from transformers.models.auto.modeling_auto import (
     MODEL_FOR_CAUSAL_LM_MAPPING_NAMES,
@@ -93,6 +99,10 @@ class LLaDA(TemplateLM):
         remasking: str = "low_confidence",
         mask_id: int = 126336,
         is_check_greedy : bool =True,
+        student_path: Optional[str] = None,
+        student_prompt_kv_cache: bool = False,
+        student_budget: int = 128,
+        student_question_window: int = 128,
         **kwargs,
     ) -> None:
         super().__init__()
@@ -105,6 +115,11 @@ class LLaDA(TemplateLM):
         self.cfg_interval_steps = cfg_interval_steps
         self.transfer_ratio = transfer_ratio
         self.is_check_greedy = is_check_greedy
+        self.student_path = student_path
+        self.student_prompt_kv_cache = self._coerce_bool(student_prompt_kv_cache)
+        self.student_budget = int(student_budget)
+        self.student_question_window = int(student_question_window)
+        self.student = None
         self.add_bos_token = add_bos_token
         self.escape_until = escape_until
         if not isinstance(pretrained, str):
@@ -316,8 +331,108 @@ class LLaDA(TemplateLM):
                     cfg_interval_steps=cfg_interval_steps if is_cfg_cache else 1,
                 )))
 
+        if self.student_prompt_kv_cache:
+            if self.student_path is None:
+                raise RuntimeError("student_prompt_kv_cache=True requires student_path")
+            self.student = self._load_prompt_utility_student(self.student_path)
+
         if self.rank == 0:
                 print(f"Feature Cache is {is_feature_cache}.CFG Cache is {is_cfg_cache},prompt_interval_steps={prompt_interval_steps}, gen_interval_steps={gen_interval_steps}, cfg_interval_steps={cfg_interval_steps},transfer_ratio={transfer_ratio}")
+
+    @staticmethod
+    def _coerce_bool(value) -> bool:
+        if isinstance(value, bool):
+            return value
+        return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+    @staticmethod
+    def _add_revealed_answer_path() -> None:
+        revealed_root = Path(__file__).resolve().parents[1] / "experiment" / "2026-07-14"
+        revealed_root_str = str(revealed_root)
+        if revealed_root_str not in sys.path:
+            sys.path.insert(0, revealed_root_str)
+
+    def _load_prompt_utility_student(self, checkpoint_dir: Union[str, os.PathLike]):
+        self._add_revealed_answer_path()
+        from revealed_answer.student_model import PromptUtilityStudent, StudentConfig
+
+        checkpoint_path = Path(checkpoint_dir)
+        if not checkpoint_path.is_absolute():
+            checkpoint_path = Path.cwd() / checkpoint_path
+        config_path = checkpoint_path / "config.json"
+        state_path = checkpoint_path / "pytorch_model.bin"
+        raw_config = json.loads(config_path.read_text(encoding="utf-8"))
+        student = PromptUtilityStudent(StudentConfig(**raw_config))
+        state = torch.load(state_path, map_location="cpu", weights_only=True)
+        student.load_state_dict(state)
+        student.to(self.device)
+        student.eval()
+        if self.rank == 0:
+            print(
+                f"Student prompt KV is enabled. checkpoint={checkpoint_path}, "
+                f"budget={self.student_budget}, question_window={self.student_question_window}",
+                flush=True,
+            )
+        return student
+
+    @torch.inference_mode()
+    def _predict_student_scores(self, input_ids: torch.Tensor) -> torch.Tensor:
+        if self.student is None:
+            raise RuntimeError("student model is not loaded")
+        if input_ids.shape[0] != 1:
+            raise RuntimeError("student prompt KV cache currently requires batch_size=1")
+        out = self.model(
+            input_ids,
+            attention_mask=torch.ones_like(input_ids),
+            output_hidden_states=True,
+            use_cache=False,
+            return_dict=True,
+        )
+        prompt_length = int(input_ids.shape[1])
+        question_count = min(max(1, self.student_question_window), prompt_length)
+        prompt_indices = torch.arange(prompt_length, dtype=torch.long, device=input_ids.device)
+        question_indices = torch.arange(
+            prompt_length - question_count,
+            prompt_length,
+            dtype=torch.long,
+            device=input_ids.device,
+        )
+        scores = []
+        for layer_id in self.student.layer_indices:
+            layer_scores = self.student.forward_layer(
+                layer_id,
+                out.hidden_states[layer_id].float(),
+                prompt_indices,
+                question_indices,
+            )
+            scores.append(torch.softmax(layer_scores.float(), dim=-1).squeeze(0).cpu())
+        return torch.stack(scores)
+
+    @torch.inference_mode()
+    def _generate_with_student_prompt_kv(self, input_ids: torch.Tensor, gen_kwargs: dict) -> torch.Tensor:
+        self._add_revealed_answer_path()
+        from revealed_answer.prompt_kv_cache import build_prompt_kv_cache
+        from revealed_answer.prompt_kv_generate import generate_with_prompt_kv
+
+        student_scores = self._predict_student_scores(input_ids)
+        prompt_cache = build_prompt_kv_cache(
+            self.model,
+            input_ids,
+            budget=self.student_budget,
+            teacher_scores=student_scores,
+        )
+        return generate_with_prompt_kv(
+            input_ids=input_ids,
+            model=self.model,
+            prompt_cache=prompt_cache,
+            steps=int(gen_kwargs.get("steps")),
+            gen_length=int(gen_kwargs.get("gen_length")),
+            block_length=int(gen_kwargs.get("block_length")),
+            cfg_scale=float(gen_kwargs.get("cfg_scale", 0.0) or 0.0),
+            remasking=gen_kwargs.get("remasking", None) if gen_kwargs.get("remasking", None) else "low_confidence",
+            mask_id=self.mask_id,
+        )
+
     def _get_accelerate_args(
         self,
         parallelize: Optional[bool] = None,
@@ -776,16 +891,19 @@ class LLaDA(TemplateLM):
                 truncation=self.truncation,
                 left_truncate_len=left_truncate_len,
             )
-            out = generate(
-                input_ids=context_enc,
-                attention_mask=attn_masks,
-                model=self.model,
-                steps=gen_kwargs.get("steps"),
-                gen_length=gen_length,
-                block_length=gen_kwargs.get("block_length"),
-                cfg_scale=gen_kwargs.get("cfg_scale"),
-                remasking=gen_kwargs.get("remasking",None) if gen_kwargs.get("remasking",None) else "low_confidence"
-            )
+            if self.student_prompt_kv_cache:
+                out = self._generate_with_student_prompt_kv(context_enc, gen_kwargs)
+            else:
+                out = generate(
+                    input_ids=context_enc,
+                    attention_mask=attn_masks,
+                    model=self.model,
+                    steps=gen_kwargs.get("steps"),
+                    gen_length=gen_length,
+                    block_length=gen_kwargs.get("block_length"),
+                    cfg_scale=gen_kwargs.get("cfg_scale"),
+                    remasking=gen_kwargs.get("remasking",None) if gen_kwargs.get("remasking",None) else "low_confidence"
+                )
             cont_toks_list = self.tokenizer.batch_decode(out, skip_special_tokens=True)
             for s in cont_toks_list:
                 if not self.escape_until:
