@@ -81,15 +81,42 @@ fi
 if should_run_task local_longbench_2wikimqa; then
   run_task local_longbench_2wikimqa 32
 fi
+if should_run_task local_longbench_hotpotqa; then
+  run_task local_longbench_hotpotqa 32
+fi
+if should_run_task local_longbench_musique; then
+  run_task local_longbench_musique 32
+fi
+if should_run_task local_longbench_narrativeqa; then
+  run_task local_longbench_narrativeqa 128
+fi
 if should_run_task local_longbench_qmsum; then
   run_task local_longbench_qmsum 512
 fi
 if should_run_task local_longbench_multi_news; then
   run_task local_longbench_multi_news 512
 fi
+if should_run_task local_longbench_gov_report; then
+  run_task local_longbench_gov_report 512
+fi
+if should_run_task local_longbench_passage_count; then
+  run_task local_longbench_passage_count 32
+fi
+if should_run_task local_longbench_passage_retrieval_en; then
+  run_task local_longbench_passage_retrieval_en 32
+fi
 if should_run_task local_longbench_lcc; then
   run_task local_longbench_lcc 64
 fi
 if should_run_task local_longbench_repobench-p; then
   run_task local_longbench_repobench-p 64
+fi
+if should_run_task local_longbench_trec; then
+  run_task local_longbench_trec 64
+fi
+if should_run_task local_longbench_samsum; then
+  run_task local_longbench_samsum 128
+fi
+if should_run_task local_longbench_triviaqa; then
+  run_task local_longbench_triviaqa 32
 fi
