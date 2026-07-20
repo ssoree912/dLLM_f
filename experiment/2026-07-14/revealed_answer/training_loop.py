@@ -32,6 +32,7 @@ class TrainingRuntime:
     model: torch.nn.Module
     student: PromptUtilityStudent
     optimizer: torch.optim.Optimizer
+    best_metric: float | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -40,9 +41,12 @@ class TeacherSplit:
     val_files: list[Path]
 
 
-def build_runtime(config: TrainConfig) -> TrainingRuntime:
+def build_runtime(config: TrainConfig, best_metric: float | None = None) -> TrainingRuntime:
     model = load_frozen_model(config)
-    student = build_student(model, config).to(config.device)
+    student = build_student(model, config)
+    if config.resume_from is not None:
+        load_student_checkpoint(student, config.resume_from)
+    student = student.to(config.device)
     optimizer = torch.optim.AdamW(
         student.parameters(),
         lr=config.lr,
@@ -53,6 +57,7 @@ def build_runtime(config: TrainConfig) -> TrainingRuntime:
         model=model,
         student=student,
         optimizer=optimizer,
+        best_metric=best_metric,
     )
 
 
@@ -83,6 +88,13 @@ def build_student(model: torch.nn.Module, config: TrainConfig) -> PromptUtilityS
     return student
 
 
+def load_student_checkpoint(student: PromptUtilityStudent, checkpoint_dir: Path) -> None:
+    state_path = checkpoint_dir / "pytorch_model.bin"
+    state = torch.load(state_path, map_location="cpu", weights_only=True)
+    student.load_state_dict(state)
+    print(f"[resume] loaded student={checkpoint_dir}", flush=True)
+
+
 def split_teacher_files(config: TrainConfig) -> TeacherSplit:
     files: list[Path] = []
     for dataset in config.datasets:
@@ -100,7 +112,9 @@ def split_teacher_files(config: TrainConfig) -> TeacherSplit:
 
 def run_training(runtime: TrainingRuntime, split: TeacherSplit, log_file: TextSink) -> None:
     t0 = time.time()
-    best_metric: float | None = None
+    best_metric = runtime.best_metric
+    if best_metric is not None:
+        print(f"[resume] previous best_metric={best_metric:.6f}", flush=True)
     for epoch in range(1, runtime.config.epochs + 1):
         runtime.student.train()
         train_loss = 0.0
@@ -112,19 +126,21 @@ def run_training(runtime: TrainingRuntime, split: TeacherSplit, log_file: TextSi
         val_loss = evaluate(runtime, split.val_files)
         train_mean = train_loss / max(1, len(split.train_files))
         metric = val_loss if val_loss is not None else train_mean
-        record = {
-            "epoch": epoch,
-            "train_loss": train_mean,
-            "val_loss": val_loss,
-            "best_metric": metric,
-            "elapsed": time.time() - t0,
-        }
-        log_file.write(json.dumps(record) + "\n")
-        log_file.flush()
         if best_metric is None or metric < best_metric:
             best_metric = metric
             runtime.student.save_pretrained(runtime.config.output_dir / "checkpoint-best")
             print(f"[epoch {epoch}] saved checkpoint-best metric={metric:.6f}", flush=True)
+        runtime.student.save_pretrained(runtime.config.output_dir / "checkpoint-last")
+        print(f"[epoch {epoch}] saved checkpoint-last", flush=True)
+        record = {
+            "epoch": epoch,
+            "train_loss": train_mean,
+            "val_loss": val_loss,
+            "best_metric": best_metric,
+            "elapsed": time.time() - t0,
+        }
+        log_file.write(json.dumps(record) + "\n")
+        log_file.flush()
         print(f"[epoch {epoch}] {record}", flush=True)
 
 

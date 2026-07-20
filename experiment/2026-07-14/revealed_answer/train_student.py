@@ -15,6 +15,7 @@ for import_root in (SCRIPT_ROOT, REPO_ROOT):
 
 from revealed_answer.train_config import parse_train_config, serializable_config
 from revealed_answer.training_loop import build_runtime, run_training, split_teacher_files
+from revealed_answer.resume_state import read_resume_state
 
 
 def main() -> int:
@@ -25,10 +26,13 @@ def main() -> int:
     (config.output_dir / "train_config.json").write_text(
         json.dumps(serializable_config(config), indent=2)
     )
-    runtime = build_runtime(config)
+    resume_state = read_resume_state(config.output_dir / "train_log.jsonl") if config.resume_from is not None else None
+    best_metric = resume_state.best_metric if resume_state is not None else None
+    runtime = build_runtime(config, best_metric=best_metric)
     split = split_teacher_files(config)
     print(f"[data] train={len(split.train_files)} val={len(split.val_files)}", flush=True)
-    with (config.output_dir / "train_log.jsonl").open("w", encoding="utf-8") as log_file:
+    log_mode = "a" if config.resume_from is not None else "w"
+    with (config.output_dir / "train_log.jsonl").open(log_mode, encoding="utf-8") as log_file:
         run_training(runtime, split, log_file)
     runtime.student.save_pretrained(config.output_dir / "checkpoint-last")
     return 0

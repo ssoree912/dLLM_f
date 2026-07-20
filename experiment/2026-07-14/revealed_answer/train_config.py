@@ -13,6 +13,7 @@ from revealed_answer.common import DEFAULT_MODEL_PATH, DEFAULT_TEACHER_ROOT
 class TrainConfig:
     teacher_root: Path
     output_dir: Path
+    resume_from: Path | None
     model_path: Path
     datasets: list[str]
     n_samples: int
@@ -40,6 +41,7 @@ def parse_train_config() -> TrainConfig:
     parser = argparse.ArgumentParser()
     parser.add_argument("--teacher-root", type=Path, default=DEFAULT_TEACHER_ROOT)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--resume-from", type=Path, default=None)
     parser.add_argument("--model", type=Path, default=DEFAULT_MODEL_PATH)
     parser.add_argument("--datasets", nargs="+", default=["2wikimqa"])
     parser.add_argument("--n-samples", type=int, default=0)
@@ -65,6 +67,7 @@ def parse_train_config() -> TrainConfig:
     return TrainConfig(
         teacher_root=args.teacher_root,
         output_dir=args.output_dir,
+        resume_from=args.resume_from,
         model_path=args.model,
         datasets=args.datasets,
         n_samples=args.n_samples,
@@ -101,10 +104,11 @@ def parse_dtype(dtype: str) -> torch.dtype:
             raise argparse.ArgumentTypeError(f"unsupported dtype: {dtype}")
 
 
-def serializable_config(config: TrainConfig) -> dict[str, str | int | float | list[str]]:
+def serializable_config(config: TrainConfig) -> dict[str, str | int | float | list[str] | None]:
     return {
         "teacher_root": str(config.teacher_root),
         "output_dir": str(config.output_dir),
+        "resume_from": str(config.resume_from) if config.resume_from is not None else None,
         "model_path": str(config.model_path),
         "datasets": config.datasets,
         "n_samples": config.n_samples,

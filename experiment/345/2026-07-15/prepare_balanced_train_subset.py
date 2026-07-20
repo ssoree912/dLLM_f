@@ -36,6 +36,11 @@ def parse_args() -> argparse.Namespace:
         default=["2wikimultihopqa"],
         help="Dataset directory name to skip. Can be passed multiple times.",
     )
+    parser.add_argument(
+        "--include-all",
+        action="store_true",
+        help="Ignore default exclusions and include every train dataset.",
+    )
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
 
@@ -168,7 +173,7 @@ def main() -> None:
     args = parse_args()
     data_root = args.data_root.resolve()
     output_root = args.output_root.resolve()
-    excluded = set(args.exclude_dataset or [])
+    excluded = set() if args.include_all else set(args.exclude_dataset or [])
 
     if output_root.exists():
         if not args.overwrite:

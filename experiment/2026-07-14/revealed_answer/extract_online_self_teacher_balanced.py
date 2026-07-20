@@ -19,13 +19,13 @@ for import_root in (SCRIPT_ROOT, REPO_ROOT):
 from revealed_answer.common import DEFAULT_MODEL_PATH, encode_text, record_output_path
 from revealed_answer.extract_teacher import load_model_and_tokenizer, parse_dtype
 from revealed_answer.online_teacher import OnlineTeacherConfig, generate_with_online_teacher
+from revealed_answer.train_prompt_templates import build_train_prompt
 
 DEFAULT_TRAIN_DATA: Final = Path(
-    "/home/M2026107/dllm/data/train_balanced_2k_excl_2wikimultihopqa/"
-    "all_selected_train_longbench_format.jsonl"
+    "/home/M2026107/dllm/data/train_balanced_2k/all_selected_train_longbench_format.jsonl"
 )
 DEFAULT_OUTPUT_ROOT: Final = Path(
-    "experiment/2026-07-14/results/online_self_generated_teacher_balanced_2k_excl_2wiki_g32"
+    "experiment/2026-07-14/results/online_self_generated_teacher_balanced_2k_g32"
 )
 
 
@@ -174,15 +174,7 @@ def parse_answers(value: object, index: int) -> list[str]:
 
 
 def build_prompt(sample: BalancedSample) -> str:
-    parts: list[str] = []
-    if sample.context.strip():
-        parts.append(sample.context.strip())
-    parts.append(sample.question.strip())
-    if sample.answer_prefix.strip():
-        parts.append(sample.answer_prefix.strip())
-    elif sample.task in {"Multi-Document QA", "Single-Document QA"}:
-        parts.append("Answer:")
-    return "\n\n".join(parts)
+    return build_train_prompt(sample)
 
 
 def tokenize_prompt_only(
