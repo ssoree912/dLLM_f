@@ -30,7 +30,6 @@ class TrecOraclePoolConfig:
     gen_length: int
     block_length: int
     steps: int
-    active_top_k: int
     selection_mode: str
     mask_id: int
 
@@ -48,7 +47,6 @@ def parse_args() -> TrecOraclePoolConfig:
     parser.add_argument("--gen-length", type=int, default=64)
     parser.add_argument("--block-length", type=int, default=8)
     parser.add_argument("--steps", type=int, default=64)
-    parser.add_argument("--active-top-k", type=int, default=128)
     parser.add_argument("--selection-mode", choices=["global", "layer_union"], default="global")
     parser.add_argument("--mask-id", type=int, default=126336)
     args = parser.parse_args()
@@ -64,7 +62,6 @@ def parse_args() -> TrecOraclePoolConfig:
         gen_length=args.gen_length,
         block_length=args.block_length,
         steps=args.steps,
-        active_top_k=args.active_top_k,
         selection_mode=args.selection_mode,
         mask_id=args.mask_id,
     )
@@ -93,7 +90,7 @@ def main() -> int:
             append_jsonl(samples_path, row)
             done.add(key)
             print(
-                f"[trec-oracle-pool {index}/{len(records)}] budget={budget} "
+                f"[trec-oracle-token-prune {index}/{len(records)}] budget={budget} "
                 f"score={row['score']:.4f} elapsed={row['elapsed_seconds']:.2f}s "
                 f"reduced_prompt={row['reduced_prompt_length']}",
                 flush=True,
@@ -184,7 +181,8 @@ def run_one(
         "selection_mode": config.selection_mode,
         "prompt_length": int(rec["prompt_length"]),
         "reduced_prompt_length": int(prompt_cache.reduced_prompt_length),
-        "active_top_k": int(config.active_top_k),
+        "inner_active_selection": False,
+        "teacher_target": "future_frequency_from_per_step_top128",
         "gen_length": int(config.gen_length),
         "steps": int(config.steps),
         "answer": answer,
