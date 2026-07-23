@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from revealed_answer.attention_teacher import NamedModuleModel, find_transformer_blocks
+from dllm_cache.budget.attention_teacher import NamedModuleModel, find_transformer_blocks
 
 
 @dataclass(slots=True)

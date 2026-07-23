@@ -1,7 +1,6 @@
 import logging
 import os
 import json
-import sys
 from datetime import timedelta
 from pathlib import Path
 from typing import Dict, List, Literal, Optional, Tuple, Union,Type,TypeVar
@@ -66,6 +65,7 @@ class LLaDA(TemplateLM):
             ]
         ] = None,
         truncation: Optional[bool] = False,
+        truncation_strategy: str = "left",
         logits_cache: bool = True,
         max_length: Optional[int] = None,
         device: Optional[str] = "cuda",
@@ -101,7 +101,10 @@ class LLaDA(TemplateLM):
         is_check_greedy : bool =True,
         student_path: Optional[str] = None,
         student_prompt_kv_cache: bool = False,
+        student_prompt_prune: bool = False,
+        student_prompt_pool_active: bool = False,
         student_budget: int = 128,
+        student_pool_budget: int = 512,
         student_question_window: int = 128,
         **kwargs,
     ) -> None:
@@ -117,11 +120,24 @@ class LLaDA(TemplateLM):
         self.is_check_greedy = is_check_greedy
         self.student_path = student_path
         self.student_prompt_kv_cache = self._coerce_bool(student_prompt_kv_cache)
+        self.student_prompt_prune = self._coerce_bool(student_prompt_prune)
+        self.student_prompt_pool_active = self._coerce_bool(student_prompt_pool_active)
         self.student_budget = int(student_budget)
+        self.student_pool_budget = int(student_pool_budget)
         self.student_question_window = int(student_question_window)
         self.student = None
         self.add_bos_token = add_bos_token
         self.escape_until = escape_until
+        active_student_modes = sum(
+            int(enabled)
+            for enabled in (
+                self.student_prompt_kv_cache,
+                self.student_prompt_prune,
+                self.student_prompt_pool_active,
+            )
+        )
+        if active_student_modes > 1:
+            raise RuntimeError("student prompt compression modes are mutually exclusive")
         if not isinstance(pretrained, str):
             eval_logger.warning(
                 "`pretrained` model kwarg is not of type `str`. Many other model arguments may be ignored. Please do not launch via accelerate or use `parallelize=True` if passing an existing model this way."
@@ -235,6 +251,9 @@ class LLaDA(TemplateLM):
             self.model.tie_weights()
 
         self.truncation = truncation
+        self.truncation_strategy = str(truncation_strategy).strip().lower()
+        if self.truncation_strategy not in {"left", "middle"}:
+            raise ValueError("truncation_strategy must be 'left' or 'middle'")
         self.logits_cache = logits_cache
         self.vocab_size = self.tokenizer.vocab_size
         # select (or create) a pad token to use
@@ -331,9 +350,9 @@ class LLaDA(TemplateLM):
                     cfg_interval_steps=cfg_interval_steps if is_cfg_cache else 1,
                 )))
 
-        if self.student_prompt_kv_cache:
+        if self.student_prompt_kv_cache or self.student_prompt_prune or self.student_prompt_pool_active:
             if self.student_path is None:
-                raise RuntimeError("student_prompt_kv_cache=True requires student_path")
+                raise RuntimeError("student prompt compression requires student_path")
             self.student = self._load_prompt_utility_student(self.student_path)
 
         if self.rank == 0:
@@ -345,16 +364,8 @@ class LLaDA(TemplateLM):
             return value
         return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
 
-    @staticmethod
-    def _add_revealed_answer_path() -> None:
-        revealed_root = Path(__file__).resolve().parents[1] / "experiment" / "2026-07-14"
-        revealed_root_str = str(revealed_root)
-        if revealed_root_str not in sys.path:
-            sys.path.insert(0, revealed_root_str)
-
     def _load_prompt_utility_student(self, checkpoint_dir: Union[str, os.PathLike]):
-        self._add_revealed_answer_path()
-        from revealed_answer.student_model import PromptUtilityStudent, StudentConfig
+        from dllm_cache.budget.student_model import PromptUtilityStudent, StudentConfig
 
         checkpoint_path = Path(checkpoint_dir)
         if not checkpoint_path.is_absolute():
@@ -368,9 +379,18 @@ class LLaDA(TemplateLM):
         student.to(self.device)
         student.eval()
         if self.rank == 0:
+            if self.student_prompt_pool_active:
+                mode = "pool-active KV cache"
+                budget_text = f"pool_budget={self.student_pool_budget}, active_budget={self.student_budget}"
+            elif self.student_prompt_prune:
+                mode = "prune"
+                budget_text = f"budget={self.student_budget}"
+            else:
+                mode = "KV cache"
+                budget_text = f"budget={self.student_budget}"
             print(
-                f"Student prompt KV is enabled. checkpoint={checkpoint_path}, "
-                f"budget={self.student_budget}, question_window={self.student_question_window}",
+                f"Student prompt {mode} is enabled. checkpoint={checkpoint_path}, "
+                f"{budget_text}, question_window={self.student_question_window}",
                 flush=True,
             )
         return student
@@ -380,7 +400,7 @@ class LLaDA(TemplateLM):
         if self.student is None:
             raise RuntimeError("student model is not loaded")
         if input_ids.shape[0] != 1:
-            raise RuntimeError("student prompt KV cache currently requires batch_size=1")
+            raise RuntimeError("student prompt compression currently requires batch_size=1")
         out = self.model(
             input_ids,
             attention_mask=torch.ones_like(input_ids),
@@ -410,9 +430,8 @@ class LLaDA(TemplateLM):
 
     @torch.inference_mode()
     def _generate_with_student_prompt_kv(self, input_ids: torch.Tensor, gen_kwargs: dict) -> torch.Tensor:
-        self._add_revealed_answer_path()
-        from revealed_answer.prompt_kv_cache import build_prompt_kv_cache
-        from revealed_answer.prompt_kv_generate import generate_with_prompt_kv
+        from dllm_cache.budget.prompt_kv_cache import build_prompt_kv_cache
+        from dllm_cache.budget.prompt_kv_generate import generate_with_prompt_kv
 
         student_scores = self._predict_student_scores(input_ids)
         prompt_cache = build_prompt_kv_cache(
@@ -429,7 +448,69 @@ class LLaDA(TemplateLM):
             gen_length=int(gen_kwargs.get("gen_length")),
             block_length=int(gen_kwargs.get("block_length")),
             cfg_scale=float(gen_kwargs.get("cfg_scale", 0.0) or 0.0),
-            remasking=gen_kwargs.get("remasking", None) if gen_kwargs.get("remasking", None) else "low_confidence",
+            remasking=gen_kwargs.get("remasking", None)
+            if gen_kwargs.get("remasking", None)
+            else "low_confidence",
+            mask_id=self.mask_id,
+        )
+
+    @torch.inference_mode()
+    def _generate_with_student_prompt_prune(self, input_ids: torch.Tensor, gen_kwargs: dict) -> torch.Tensor:
+        from dllm_cache.budget.oracle_prune import install_oracle_pruner
+
+        student_scores = self._predict_student_scores(input_ids)
+        controller = install_oracle_pruner(
+            self.model,
+            prompt_length=int(input_ids.shape[1]),
+            budget=self.student_budget,
+            teacher_scores=student_scores,
+        )
+        try:
+            output = generate(
+                input_ids=input_ids,
+                attention_mask=torch.ones_like(input_ids),
+                model=self.model,
+                steps=int(gen_kwargs.get("steps")),
+                gen_length=int(gen_kwargs.get("gen_length")),
+                block_length=int(gen_kwargs.get("block_length")),
+                cfg_scale=float(gen_kwargs.get("cfg_scale", 0.0) or 0.0),
+                remasking=gen_kwargs.get("remasking", None)
+                if gen_kwargs.get("remasking", None)
+                else "low_confidence",
+                mask_id=self.mask_id,
+            )
+            if controller.pruned_attention_calls == 0:
+                raise RuntimeError("student prompt pruning did not intercept any attention calls")
+            return output
+        finally:
+            controller.restore()
+
+    @torch.inference_mode()
+    def _generate_with_student_prompt_pool_active(self, input_ids: torch.Tensor, gen_kwargs: dict) -> torch.Tensor:
+        from dllm_cache.budget.pool_active_prompt_kv import (
+            build_pool_active_prompt_kv_cache,
+            generate_with_pool_active_prompt_kv,
+        )
+
+        cfg_scale = float(gen_kwargs.get("cfg_scale", 0.0) or 0.0)
+        if cfg_scale != 0.0:
+            raise RuntimeError("student prompt pool-active generation does not support cfg_scale")
+        student_scores = self._predict_student_scores(input_ids)
+        prompt_cache = build_pool_active_prompt_kv_cache(
+            self.model,
+            input_ids,
+            pool_budget=self.student_pool_budget,
+            active_budget=self.student_budget,
+            teacher_scores=student_scores,
+        )
+        return generate_with_pool_active_prompt_kv(
+            input_ids=input_ids,
+            model=self.model,
+            prompt_cache=prompt_cache,
+            steps=int(gen_kwargs.get("steps")),
+            gen_length=int(gen_kwargs.get("gen_length")),
+            block_length=int(gen_kwargs.get("block_length")),
+            refresh_interval=1,
             mask_id=self.mask_id,
         )
 
@@ -803,6 +884,7 @@ class LLaDA(TemplateLM):
         padding_side: str = "left",
         left_truncate_len: int = None,
         truncation: bool = False,
+        truncation_strategy: str = "left",
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # encode a batch of strings. converts to tensors and pads automatically, unlike tok_encode.
         old_padding_side = self.tokenizer.padding_side
@@ -819,7 +901,45 @@ class LLaDA(TemplateLM):
             return_tensors="pt",
             **add_special_tokens,
         )
-        if left_truncate_len:
+        if left_truncate_len and truncation_strategy == "middle":
+            original_lengths = encoding["attention_mask"].sum(dim=1).tolist()
+            if any(length > left_truncate_len for length in original_lengths):
+                eval_logger.warn(
+                    f"Middle truncation applied. Original sequence lengths were {original_lengths}, "
+                    f"truncating to first/last {left_truncate_len} tokens. Some middle content will be lost.",
+                )
+            truncated_rows = []
+            masks = []
+            pad_id = self.tokenizer.pad_token_id
+            for input_ids, attention_mask in zip(encoding["input_ids"], encoding["attention_mask"]):
+                valid_tokens = input_ids[attention_mask.bool()]
+                if valid_tokens.numel() > left_truncate_len:
+                    head_len = left_truncate_len // 2
+                    tail_len = left_truncate_len - head_len
+                    valid_tokens = torch.cat([valid_tokens[:head_len], valid_tokens[-tail_len:]], dim=0)
+                truncated_rows.append(valid_tokens)
+            max_row_len = max(row.numel() for row in truncated_rows)
+            rows = []
+            for row in truncated_rows:
+                pad_len = max_row_len - row.numel()
+                pad = torch.full((pad_len,), pad_id, dtype=row.dtype)
+                if padding_side == "left":
+                    row_ids = torch.cat([pad, row], dim=0)
+                    row_mask = torch.cat(
+                        [torch.zeros(pad_len, dtype=encoding["attention_mask"].dtype), torch.ones(row.numel(), dtype=encoding["attention_mask"].dtype)],
+                        dim=0,
+                    )
+                else:
+                    row_ids = torch.cat([row, pad], dim=0)
+                    row_mask = torch.cat(
+                        [torch.ones(row.numel(), dtype=encoding["attention_mask"].dtype), torch.zeros(pad_len, dtype=encoding["attention_mask"].dtype)],
+                        dim=0,
+                    )
+                rows.append(row_ids)
+                masks.append(row_mask)
+            encoding["input_ids"] = torch.stack(rows)
+            encoding["attention_mask"] = torch.stack(masks)
+        elif left_truncate_len:
             original_lengths = encoding["input_ids"].size(1)
             if original_lengths > left_truncate_len:
                 eval_logger.warn(
@@ -890,8 +1010,13 @@ class LLaDA(TemplateLM):
                 contexts,
                 truncation=self.truncation,
                 left_truncate_len=left_truncate_len,
+                truncation_strategy=self.truncation_strategy,
             )
-            if self.student_prompt_kv_cache:
+            if self.student_prompt_pool_active:
+                out = self._generate_with_student_prompt_pool_active(context_enc, gen_kwargs)
+            elif self.student_prompt_prune:
+                out = self._generate_with_student_prompt_prune(context_enc, gen_kwargs)
+            elif self.student_prompt_kv_cache:
                 out = self._generate_with_student_prompt_kv(context_enc, gen_kwargs)
             else:
                 out = generate(
