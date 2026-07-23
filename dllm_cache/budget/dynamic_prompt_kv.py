@@ -74,6 +74,9 @@ def build_dynamic_prompt_kv_cache(
     budget: int,
     teacher_scores: torch.Tensor,
     selection_mode: str = "layer_union",
+    budget_mode: str = "fixed",
+    min_budget: int = 1,
+    budget_scale: float = 1.0,
 ) -> DynamicPromptKVCache:
     blocks = find_transformer_blocks(model)
     prompt_length = int(prompt_ids.shape[1])
@@ -89,6 +92,9 @@ def build_dynamic_prompt_kv_cache(
         budget,
         len(blocks),
         selection_mode,
+        budget_mode,
+        min_budget,
+        budget_scale,
     )
     union_indices = torch.unique(
         torch.cat(list(keep_indices_by_layer.values()), dim=0),
@@ -116,23 +122,53 @@ def build_keep_indices_by_layer(
     budget: int,
     layer_count: int,
     selection_mode: str,
+    budget_mode: str = "fixed",
+    min_budget: int = 1,
+    budget_scale: float = 1.0,
 ) -> dict[int, torch.Tensor]:
     if selection_mode == "layer_union":
         return {
-            layer_id: topk_prompt_indices(scores[layer_id], prompt_length, budget)
+            layer_id: topk_prompt_indices(scores[layer_id], prompt_length, budget, budget_mode, min_budget, budget_scale)
             for layer_id in range(layer_count)
         }
     if selection_mode == "global":
-        keep = topk_prompt_indices(scores.mean(dim=0), prompt_length, budget)
+        keep = topk_prompt_indices(scores.mean(dim=0), prompt_length, budget, budget_mode, min_budget, budget_scale)
         return {layer_id: keep for layer_id in range(layer_count)}
     raise RuntimeError(f"unsupported prompt selection mode: {selection_mode}")
 
 
-def topk_prompt_indices(scores: torch.Tensor, prompt_length: int, budget: int) -> torch.Tensor:
+def topk_prompt_indices(
+    scores: torch.Tensor,
+    prompt_length: int,
+    budget: int,
+    budget_mode: str = "fixed",
+    min_budget: int = 1,
+    budget_scale: float = 1.0,
+) -> torch.Tensor:
     if scores.numel() != prompt_length:
         raise RuntimeError("teacher score width does not match prompt length")
-    keep_count = max(1, min(int(budget), prompt_length))
+    keep_count = resolve_keep_count(scores, prompt_length, budget, budget_mode, min_budget, budget_scale)
     return torch.topk(scores, k=keep_count, largest=True).indices.sort().values.to(dtype=torch.long)
+
+
+def resolve_keep_count(
+    scores: torch.Tensor,
+    prompt_length: int,
+    budget: int,
+    budget_mode: str,
+    min_budget: int,
+    budget_scale: float,
+) -> int:
+    max_budget = max(1, min(int(budget), prompt_length))
+    if budget_mode == "fixed":
+        return max_budget
+    if budget_mode == "predicted_mass":
+        if budget_scale <= 0.0:
+            raise RuntimeError("budget_scale must be positive for predicted_mass budget mode")
+        expected_size = float(scores.float().clamp(0.0, 1.0).sum().item()) * float(budget_scale)
+        adaptive = int(math.ceil(expected_size))
+        return max(1, min(max_budget, max(int(min_budget), adaptive)))
+    raise RuntimeError(f"unsupported prompt budget mode: {budget_mode}")
 
 
 @torch.inference_mode()

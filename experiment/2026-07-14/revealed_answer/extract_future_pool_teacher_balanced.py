@@ -232,7 +232,10 @@ def extract_one(
     prompt_tensor = torch.tensor(example.prompt_ids, dtype=torch.long)
     return {
         "teacher_kind": "future_temporal_union_pool",
-        "teacher_formula": "mask_union_t top_active_k(sum_committed_suffix_attention_t); rank_by_temporal_importance",
+        "teacher_formula": (
+            "mask_union_t top_active_k(sum_committed_suffix_attention_t); "
+            "future_frequency_i=count_t(i in top_active_k)/active_update_steps"
+        ),
         "teacher_graph": "full_sequence_prompt_suffix",
         "sample_id": sample.sample_id,
         "dataset": sample.dataset,
@@ -247,9 +250,12 @@ def extract_one(
         "question_token_indices": example.question_indices,
         "teacher_raw": result.teacher_raw.to(torch.float16),
         "teacher_norm": result.teacher_norm.to(torch.float16),
+        "future_frequency": result.future_frequency.to(torch.float16),
+        "future_frequency_count": result.future_frequency_count,
         "future_union_mask": result.union_mask,
         "future_union_size_by_layer": result.union_size_by_layer,
         "union_size_mean": float(result.union_size_by_layer.float().mean().item()),
+        "frequency_denominator": result.frequency_denominator,
         "prompt_length": example.prompt_length,
         "generated_length": int(result.generated_ids.numel()),
         "sequence_length": example.prompt_length + int(result.generated_ids.numel()),

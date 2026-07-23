@@ -119,10 +119,10 @@ def run_training(runtime: TrainingRuntime, split: TeacherSplit, log_file: TextSi
         runtime.student.train()
         train_loss = 0.0
         for step, path in enumerate(split.train_files, start=1):
-            loss, mse, rank, topk = train_one_file(runtime, path)
+            loss, primary, rank, topk = train_one_file(runtime, path)
             train_loss += loss
             if step % runtime.config.log_every == 0 or step == len(split.train_files):
-                print_train_step(runtime, epoch, step, train_loss, mse, rank, topk, split)
+                print_train_step(runtime, epoch, step, train_loss, primary, rank, topk, split)
         val_loss = evaluate(runtime, split.val_files)
         train_mean = train_loss / max(1, len(split.train_files))
         metric = val_loss if val_loss is not None else train_mean
@@ -149,14 +149,14 @@ def print_train_step(
     epoch: int,
     step: int,
     train_loss: float,
-    mse: float,
+    primary: float,
     rank: float,
     topk: float,
     split: TeacherSplit,
 ) -> None:
     print(
         f"[epoch {epoch}/{runtime.config.epochs} step {step}/{len(split.train_files)}] "
-        f"loss={train_loss / step:.6f} mse={mse:.6f} rank={rank:.6f} topk={topk:.6f}",
+        f"loss={train_loss / step:.6f} primary={primary:.6f} rank={rank:.6f} topk={topk:.6f}",
         flush=True,
     )
 
@@ -166,10 +166,10 @@ def train_one_file(runtime: TrainingRuntime, path: Path) -> tuple[float, float, 
     hidden_states = compute_prompt_hidden_states(runtime, rec["prompt_input_ids"])
     prompt_indices = rec["prompt_token_indices"].to(runtime.config.device)
     question_indices = rec["question_token_indices"].to(runtime.config.device)
-    teacher_norm = rec["teacher_norm"].to(runtime.config.device)
+    teacher_target = teacher_target_from_record(rec, runtime.config).to(runtime.config.device)
     runtime.optimizer.zero_grad(set_to_none=True)
     loss_total = torch.zeros((), dtype=torch.float32, device=runtime.config.device)
-    mse_total = rank_total = topk_total = 0.0
+    primary_total = rank_total = topk_total = 0.0
     for layer_id in runtime.student.layer_indices:
         scores = runtime.student.forward_layer(
             layer_id,
@@ -177,10 +177,10 @@ def train_one_file(runtime: TrainingRuntime, path: Path) -> tuple[float, float, 
             prompt_indices,
             question_indices,
         )
-        target = teacher_norm[layer_id].float().unsqueeze(0)
-        loss, mse, rank, topk = student_loss_from_runtime(runtime, scores, target)
+        target = teacher_target[layer_id].float().unsqueeze(0)
+        loss, primary, rank, topk = student_loss_from_runtime(runtime, scores, target)
         loss_total = loss_total + loss
-        mse_total += float(mse.detach().cpu())
+        primary_total += float(primary.detach().cpu())
         rank_total += float(rank.detach().cpu())
         topk_total += float(topk.detach().cpu())
     loss_total.backward()
@@ -189,7 +189,7 @@ def train_one_file(runtime: TrainingRuntime, path: Path) -> tuple[float, float, 
     layer_count = len(runtime.student.layer_indices)
     return (
         float(loss_total.detach().cpu()),
-        mse_total / layer_count,
+        primary_total / layer_count,
         rank_total / layer_count,
         topk_total / layer_count,
     )
@@ -211,7 +211,7 @@ def evaluate_one_file(runtime: TrainingRuntime, path: Path) -> float:
     hidden_states = compute_prompt_hidden_states(runtime, rec["prompt_input_ids"])
     prompt_indices = rec["prompt_token_indices"].to(runtime.config.device)
     question_indices = rec["question_token_indices"].to(runtime.config.device)
-    teacher_norm = rec["teacher_norm"].to(runtime.config.device)
+    teacher_target = teacher_target_from_record(rec, runtime.config).to(runtime.config.device)
     file_loss = 0.0
     for layer_id in runtime.student.layer_indices:
         scores = runtime.student.forward_layer(
@@ -220,7 +220,7 @@ def evaluate_one_file(runtime: TrainingRuntime, path: Path) -> float:
             prompt_indices,
             question_indices,
         )
-        target = teacher_norm[layer_id].float().unsqueeze(0)
+        target = teacher_target[layer_id].float().unsqueeze(0)
         loss, _mse, _rank, _topk = student_loss_from_runtime(runtime, scores, target)
         file_loss += float(loss.detach().cpu())
     return file_loss
@@ -257,4 +257,25 @@ def student_loss_from_runtime(
         runtime.config.topk_weight,
         runtime.config.topk_k,
         runtime.config.topk_positive_weight,
+        runtime.config.loss_mode,
+        runtime.config.bce_positive_weight,
+        runtime.config.rank_input,
     )
+
+
+def teacher_target_from_record(rec: dict, config: TrainConfig) -> torch.Tensor:
+    match config.target_mode:
+        case "score":
+            return rec["teacher_norm"].float()
+        case "frequency":
+            if "future_frequency" in rec:
+                return rec["future_frequency"].float()
+            if "future_union_mask" in rec:
+                return rec["future_union_mask"].float()
+            raise RuntimeError("target-mode=frequency requires future_frequency or future_union_mask in teacher record")
+        case "union":
+            if "future_union_mask" not in rec:
+                raise RuntimeError("target-mode=union requires future_union_mask in teacher record")
+            return rec["future_union_mask"].float()
+        case _:
+            raise RuntimeError(f"unsupported target_mode: {config.target_mode}")

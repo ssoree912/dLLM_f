@@ -35,8 +35,11 @@ class FuturePoolTeacherResult:
     generated_ids: torch.Tensor
     teacher_raw: torch.Tensor
     teacher_norm: torch.Tensor
+    future_frequency: torch.Tensor
+    future_frequency_count: torch.Tensor
     union_mask: torch.Tensor
     union_size_by_layer: torch.Tensor
+    frequency_denominator: int
     commit_count: int
     weight_sum: float
 
@@ -45,9 +48,11 @@ class FuturePoolTeacherResult:
 class FuturePoolTrace:
     sum_scores: torch.Tensor
     max_scores: torch.Tensor
+    frequency_count: torch.Tensor
     union_mask: torch.Tensor
     confidence_weight: bool
     active_top_k: int
+    frequency_denominator: int = 0
     commit_count: int = 0
     weight_sum: float = 0.0
 
@@ -80,6 +85,7 @@ def generate_with_future_pool_teacher(
     trace = FuturePoolTrace(
         sum_scores=torch.zeros((layer_count, prompt_length), device=prompt_ids.device),
         max_scores=torch.zeros((layer_count, prompt_length), device=prompt_ids.device),
+        frequency_count=torch.zeros((layer_count, prompt_length), dtype=torch.int32, device=prompt_ids.device),
         union_mask=torch.zeros((layer_count, prompt_length), dtype=torch.bool, device=prompt_ids.device),
         confidence_weight=config.confidence_weight,
         active_top_k=config.active_top_k,
@@ -118,12 +124,18 @@ def generate_with_future_pool_teacher(
         collector.restore()
     teacher_raw = trace.aggregate(config.target_aggregation).detach().cpu().float()
     teacher_norm = normalize_scores(teacher_raw)
+    denominator = max(1, trace.frequency_denominator)
+    future_frequency_count = trace.frequency_count.detach().cpu()
+    future_frequency = future_frequency_count.float() / float(denominator)
     return FuturePoolTeacherResult(
         generated_ids=suffix_ids.detach().cpu().squeeze(0),
         teacher_raw=teacher_raw,
         teacher_norm=teacher_norm,
+        future_frequency=future_frequency,
+        future_frequency_count=future_frequency_count,
         union_mask=trace.union_mask.detach().cpu(),
         union_size_by_layer=trace.union_mask.sum(dim=-1).detach().cpu(),
+        frequency_denominator=trace.frequency_denominator,
         commit_count=trace.commit_count,
         weight_sum=trace.weight_sum,
     )
@@ -158,8 +170,14 @@ def accumulate_future_pool(
         top_count = min(trace.active_top_k, int(scores.numel()))
         top_indices = torch.topk(scores, k=top_count, largest=True).indices
         trace.union_mask[layer_id].scatter_(dim=0, index=top_indices, value=True)
+        trace.frequency_count[layer_id].scatter_add_(
+            dim=0,
+            index=top_indices,
+            src=torch.ones_like(top_indices, dtype=trace.frequency_count.dtype),
+        )
         trace.sum_scores[layer_id] += scores
         trace.max_scores[layer_id] = torch.maximum(trace.max_scores[layer_id], scores)
+    trace.frequency_denominator += 1
     trace.commit_count += int(selected.numel())
     trace.weight_sum += float(weights.sum().detach().cpu())
 

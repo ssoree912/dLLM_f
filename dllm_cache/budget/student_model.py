@@ -113,19 +113,52 @@ def student_loss(
     topk_weight: float = 0.0,
     topk_k: int = 128,
     topk_positive_weight: float = 8.0,
+    loss_mode: str = "mse",
+    bce_positive_weight: float = 1.0,
+    rank_input: str = "prob",
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    pred = F.softmax(scores.float(), dim=-1)
+    logits = scores.float()
     target = target.float()
-    mse = F.mse_loss(pred, target)
+    match loss_mode:
+        case "mse":
+            pred = F.softmax(logits, dim=-1)
+            primary = F.mse_loss(pred, target)
+        case "bce":
+            pred = torch.sigmoid(logits)
+            primary = soft_label_bce_loss(logits, target, bce_positive_weight)
+        case _:
+            raise RuntimeError(f"unsupported student loss_mode: {loss_mode}")
+    match rank_input:
+        case "prob":
+            rank_pred = pred
+        case "logit":
+            rank_pred = logits
+        case _:
+            raise RuntimeError(f"unsupported rank_input: {rank_input}")
     rank = pairwise_ranking_loss(
-        pred,
+        rank_pred,
         target,
         margin=rank_margin,
         top_ratio=rank_top_ratio,
         bottom_ratio=rank_bottom_ratio,
     )
-    topk = topk_bce_loss(scores.float(), target, topk_k, topk_positive_weight)
-    return mse + rank_weight * rank + topk_weight * topk, mse, rank, topk
+    topk = topk_bce_loss(logits, target, topk_k, topk_positive_weight)
+    return primary + rank_weight * rank + topk_weight * topk, primary, rank, topk
+
+
+def soft_label_bce_loss(
+    logits: torch.Tensor,
+    target: torch.Tensor,
+    positive_weight: float,
+) -> torch.Tensor:
+    if logits.shape != target.shape or logits.ndim != 2:
+        raise RuntimeError("logits and target must have matching [batch, prompt] shape")
+    pos_weight = torch.full((), positive_weight, dtype=logits.dtype, device=logits.device)
+    return F.binary_cross_entropy_with_logits(
+        logits.float(),
+        target.float().clamp(0.0, 1.0),
+        pos_weight=pos_weight,
+    )
 
 
 def topk_bce_loss(

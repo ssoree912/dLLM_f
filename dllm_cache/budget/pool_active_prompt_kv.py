@@ -28,6 +28,9 @@ class PoolActivePromptKVCache:
     teacher_scores: torch.Tensor
     layer_count: int
     selection_mode: str
+    budget_mode: str
+    min_pool_budget: int
+    pool_budget_scale: float
     union_indices: torch.Tensor
     pool_indices_by_layer: dict[int, torch.Tensor]
     pool_offsets_by_layer: dict[int, torch.Tensor]
@@ -79,13 +82,25 @@ def build_pool_active_prompt_kv_cache(
     active_budget: int,
     teacher_scores: torch.Tensor,
     selection_mode: str = "global",
+    budget_mode: str = "fixed",
+    min_pool_budget: int = 1,
+    pool_budget_scale: float = 1.0,
 ) -> PoolActivePromptKVCache:
     blocks = find_transformer_blocks(model)
     prompt_length = int(prompt_ids.shape[1])
     scores = teacher_scores.detach().float().cpu()
     if scores.shape != (len(blocks), prompt_length):
         raise RuntimeError(f"teacher score shape must be ({len(blocks)}, {prompt_length}), got {tuple(scores.shape)}")
-    pool_indices_by_layer = build_keep_indices_by_layer(scores, prompt_length, pool_budget, len(blocks), selection_mode)
+    pool_indices_by_layer = build_keep_indices_by_layer(
+        scores,
+        prompt_length,
+        pool_budget,
+        len(blocks),
+        selection_mode,
+        budget_mode,
+        min_pool_budget,
+        pool_budget_scale,
+    )
     union_indices = torch.unique(torch.cat(list(pool_indices_by_layer.values()), dim=0), sorted=True).to(dtype=torch.long)
     pool_offsets_by_layer = {
         layer_id: torch.searchsorted(union_indices, pool_indices)
@@ -98,6 +113,9 @@ def build_pool_active_prompt_kv_cache(
         teacher_scores=scores,
         layer_count=len(blocks),
         selection_mode=selection_mode,
+        budget_mode=budget_mode,
+        min_pool_budget=int(min_pool_budget),
+        pool_budget_scale=float(pool_budget_scale),
         union_indices=union_indices,
         pool_indices_by_layer=pool_indices_by_layer,
         pool_offsets_by_layer=pool_offsets_by_layer,

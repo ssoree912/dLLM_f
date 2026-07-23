@@ -105,7 +105,11 @@ class LLaDA(TemplateLM):
         student_prompt_pool_active: bool = False,
         student_budget: int = 128,
         student_pool_budget: int = 512,
+        student_min_pool_budget: int = 1,
+        student_pool_budget_mode: str = "fixed",
+        student_pool_budget_scale: float = 1.0,
         student_question_window: int = 128,
+        student_score_activation: str = "softmax",
         **kwargs,
     ) -> None:
         super().__init__()
@@ -124,7 +128,15 @@ class LLaDA(TemplateLM):
         self.student_prompt_pool_active = self._coerce_bool(student_prompt_pool_active)
         self.student_budget = int(student_budget)
         self.student_pool_budget = int(student_pool_budget)
+        self.student_min_pool_budget = int(student_min_pool_budget)
+        self.student_pool_budget_mode = str(student_pool_budget_mode).strip().lower()
+        if self.student_pool_budget_mode not in {"fixed", "predicted_mass"}:
+            raise RuntimeError("student_pool_budget_mode must be one of: fixed, predicted_mass")
+        self.student_pool_budget_scale = float(student_pool_budget_scale)
         self.student_question_window = int(student_question_window)
+        self.student_score_activation = str(student_score_activation).strip().lower()
+        if self.student_score_activation not in {"softmax", "sigmoid", "raw"}:
+            raise RuntimeError("student_score_activation must be one of: softmax, sigmoid, raw")
         self.student = None
         self.add_bos_token = add_bos_token
         self.escape_until = escape_until
@@ -381,7 +393,10 @@ class LLaDA(TemplateLM):
         if self.rank == 0:
             if self.student_prompt_pool_active:
                 mode = "pool-active KV cache"
-                budget_text = f"pool_budget={self.student_pool_budget}, active_budget={self.student_budget}"
+                budget_text = (
+                    f"pool_budget={self.student_pool_budget}, active_budget={self.student_budget}, "
+                    f"pool_budget_mode={self.student_pool_budget_mode}, score_activation={self.student_score_activation}"
+                )
             elif self.student_prompt_prune:
                 mode = "prune"
                 budget_text = f"budget={self.student_budget}"
@@ -425,7 +440,17 @@ class LLaDA(TemplateLM):
                 prompt_indices,
                 question_indices,
             )
-            scores.append(torch.softmax(layer_scores.float(), dim=-1).squeeze(0).cpu())
+            layer_scores = layer_scores.float()
+            match self.student_score_activation:
+                case "softmax":
+                    layer_scores = torch.softmax(layer_scores, dim=-1)
+                case "sigmoid":
+                    layer_scores = torch.sigmoid(layer_scores)
+                case "raw":
+                    pass
+                case _:
+                    raise RuntimeError(f"unsupported student_score_activation: {self.student_score_activation}")
+            scores.append(layer_scores.squeeze(0).cpu())
         return torch.stack(scores)
 
     @torch.inference_mode()
@@ -502,6 +527,9 @@ class LLaDA(TemplateLM):
             pool_budget=self.student_pool_budget,
             active_budget=self.student_budget,
             teacher_scores=student_scores,
+            budget_mode=self.student_pool_budget_mode,
+            min_pool_budget=self.student_min_pool_budget,
+            pool_budget_scale=self.student_pool_budget_scale,
         )
         return generate_with_pool_active_prompt_kv(
             input_ids=input_ids,
