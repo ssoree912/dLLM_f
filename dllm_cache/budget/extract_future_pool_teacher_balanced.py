@@ -14,15 +14,16 @@ from typing import Final, Sequence
 
 import torch
 
-from dllm_cache.budget.common import DEFAULT_MODEL_PATH, record_output_path
+from dllm_cache.budget.common import DEFAULT_MODEL_PATH, encode_text, record_output_path
 from dllm_cache.budget.balanced_teacher import (
     BalancedSample,
     DecodeTokenizer,
+    PromptOnlyExample,
     parse_balanced_sample,
-    tokenize_prompt_only,
 )
 from dllm_cache.budget.extract_teacher import load_model_and_tokenizer, parse_dtype
 from dllm_cache.budget.future_pool_teacher import FuturePoolTeacherConfig, generate_with_future_pool_teacher
+from dllm_cache.budget.train_prompt_templates import build_train_prompt
 
 DEFAULT_TRAIN_DATA: Final = Path(
     "/home/M2026107/dllm/data/train_balanced_2k/all_selected_train_longbench_format.jsonl"
@@ -76,7 +77,7 @@ def parse_args() -> ExtractFuturePoolConfig:
     parser.add_argument("--target-aggregation", choices=["max", "sum"], default="max")
     parser.add_argument("--min-raw-length", type=int, default=0)
     parser.add_argument("--skip-matching-samples", type=int, default=0)
-    parser.add_argument("--prompt-format", choices=["train", "samsum-eval-fewshot"], default="train")
+    parser.add_argument("--prompt-format", choices=["train", "samsum-eval-fewshot", "longbench-local"], default="train")
     parser.add_argument("--fewshot-context-chars", type=int, default=35000)
     args = parser.parse_args()
     return ExtractFuturePoolConfig(
@@ -173,8 +174,50 @@ def format_prompt_samples(
             if any(sample.dataset != "samsum" for sample in selected):
                 raise RuntimeError("samsum-eval-fewshot prompt format only supports samsum")
             return build_samsum_eval_fewshot_samples(selected, candidates, config.fewshot_context_chars)
+        case "longbench-local":
+            return list(selected)
         case _:
             raise RuntimeError(f"unsupported prompt format: {config.prompt_format}")
+
+
+def tokenize_prompt_only(
+    tokenizer: DecodeTokenizer,
+    sample: BalancedSample,
+    config: ExtractFuturePoolConfig,
+) -> PromptOnlyExample:
+    prompt_text = build_prompt_text(sample, config.prompt_format)
+    prompt_ids_full = encode_text(tokenizer, prompt_text)
+    prompt_cap = max(1, config.max_length - config.gen_length)
+    truncation_offset = max(0, len(prompt_ids_full) - prompt_cap)
+    prompt_ids = prompt_ids_full[truncation_offset:]
+    question_count = min(max(1, config.question_window), len(prompt_ids))
+    question_start = len(prompt_ids) - question_count
+    return PromptOnlyExample(
+        prompt_text=prompt_text,
+        prompt_ids=prompt_ids,
+        question_indices=torch.arange(question_start, len(prompt_ids), dtype=torch.long),
+        truncation_offset=truncation_offset,
+    )
+
+
+def build_prompt_text(sample: BalancedSample, prompt_format: str) -> str:
+    match prompt_format:
+        case "longbench-local":
+            return build_longbench_local_prompt(sample)
+        case "train" | "samsum-eval-fewshot":
+            return build_train_prompt(sample)
+        case _:
+            raise RuntimeError(f"unsupported prompt format: {prompt_format}")
+
+
+def build_longbench_local_prompt(sample: BalancedSample) -> str:
+    if sample.dataset != "trec":
+        raise RuntimeError("longbench-local prompt format currently supports trec only")
+    return (
+        "Please determine the type of the question below. Here are some examples of questions.\n\n"
+        f"{sample.context.strip()}\n"
+        f"{sample.question.strip()}"
+    )
 
 
 def build_samsum_eval_fewshot_samples(
