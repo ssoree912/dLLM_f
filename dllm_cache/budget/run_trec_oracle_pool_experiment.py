@@ -175,6 +175,8 @@ def run_one(
         selection_mode=config.selection_mode,
     )
     torch.cuda.synchronize() if input_ids.device.type == "cuda" else None
+    memory_before = cuda_memory_snapshot(input_ids.device)
+    reset_cuda_peak_memory(input_ids.device)
     t0 = time.perf_counter()
     output_ids = generate_with_pool_active_prompt_kv(
         input_ids=input_ids,
@@ -189,6 +191,7 @@ def run_one(
     )
     torch.cuda.synchronize() if input_ids.device.type == "cuda" else None
     elapsed = time.perf_counter() - t0
+    memory_peak = cuda_memory_peak_snapshot(input_ids.device, memory_before)
     prediction = tokenizer.batch_decode(output_ids, skip_special_tokens=True)[0].strip()
     prediction_for_score = prediction.split("\n", 1)[0].strip() if config.score_until_newline else prediction
     answers = parse_answers(data.get("answers"))
@@ -221,6 +224,8 @@ def run_one(
         "raw_64_token_classification_score": float(raw_score),
         "union_size_mean": float(union_size.float().mean().item()) if torch.is_tensor(union_size) else None,
         "elapsed_seconds": float(elapsed),
+        **memory_before,
+        **memory_peak,
     }
 
 
@@ -249,6 +254,49 @@ def classification_score(prediction: str, ground_truth: str, all_classes: list[s
     if ground_truth in filtered:
         return 1.0 / float(len(filtered))
     return 0.0
+
+
+def cuda_memory_snapshot(device: torch.device) -> dict[str, int | None]:
+    if device.type != "cuda":
+        return {
+            "cuda_memory_allocated_before_bytes": None,
+            "cuda_memory_reserved_before_bytes": None,
+        }
+    return {
+        "cuda_memory_allocated_before_bytes": int(torch.cuda.memory_allocated(device)),
+        "cuda_memory_reserved_before_bytes": int(torch.cuda.memory_reserved(device)),
+    }
+
+
+def reset_cuda_peak_memory(device: torch.device) -> None:
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
+
+
+def cuda_memory_peak_snapshot(device: torch.device, memory_before: dict[str, int | None]) -> dict[str, int | None]:
+    if device.type != "cuda":
+        return {
+            "cuda_peak_memory_allocated_bytes": None,
+            "cuda_peak_memory_reserved_bytes": None,
+            "cuda_peak_memory_allocated_delta_bytes": None,
+            "cuda_peak_memory_reserved_delta_bytes": None,
+            "cuda_memory_allocated_after_bytes": None,
+            "cuda_memory_reserved_after_bytes": None,
+        }
+    allocated_before = int(torch.cuda.memory_allocated(device))
+    reserved_before = int(torch.cuda.memory_reserved(device))
+    allocated_start = int(memory_before["cuda_memory_allocated_before_bytes"] or 0)
+    reserved_start = int(memory_before["cuda_memory_reserved_before_bytes"] or 0)
+    peak_allocated = int(torch.cuda.max_memory_allocated(device))
+    peak_reserved = int(torch.cuda.max_memory_reserved(device))
+    return {
+        "cuda_peak_memory_allocated_bytes": peak_allocated,
+        "cuda_peak_memory_reserved_bytes": peak_reserved,
+        "cuda_peak_memory_allocated_delta_bytes": peak_allocated - allocated_start,
+        "cuda_peak_memory_reserved_delta_bytes": peak_reserved - reserved_start,
+        "cuda_memory_allocated_after_bytes": allocated_before,
+        "cuda_memory_reserved_after_bytes": reserved_before,
+    }
 
 
 def append_jsonl(path: Path, row: dict) -> None:
@@ -280,6 +328,24 @@ def write_summary(samples_path: Path, config: TrecOraclePoolConfig) -> None:
                 ),
                 "elapsed_seconds_mean": mean(float(row["elapsed_seconds"]) for row in values),
                 "reduced_prompt_length_mean": mean(float(row["reduced_prompt_length"]) for row in values),
+                "cuda_peak_memory_allocated_bytes_mean": mean_optional(
+                    row.get("cuda_peak_memory_allocated_bytes") for row in values
+                ),
+                "cuda_peak_memory_allocated_bytes_max": max_optional(
+                    row.get("cuda_peak_memory_allocated_bytes") for row in values
+                ),
+                "cuda_peak_memory_reserved_bytes_mean": mean_optional(
+                    row.get("cuda_peak_memory_reserved_bytes") for row in values
+                ),
+                "cuda_peak_memory_reserved_bytes_max": max_optional(
+                    row.get("cuda_peak_memory_reserved_bytes") for row in values
+                ),
+                "cuda_peak_memory_allocated_delta_bytes_mean": mean_optional(
+                    row.get("cuda_peak_memory_allocated_delta_bytes") for row in values
+                ),
+                "cuda_peak_memory_allocated_delta_bytes_max": max_optional(
+                    row.get("cuda_peak_memory_allocated_delta_bytes") for row in values
+                ),
             }
             for budget, values in sorted(grouped.items())
         },
@@ -297,6 +363,16 @@ def read_rows(path: Path) -> list[dict]:
 def mean(values: Iterable[float]) -> float:
     values = list(values)
     return sum(values) / len(values) if values else 0.0
+
+
+def mean_optional(values: Iterable[object]) -> float | None:
+    numeric = [float(value) for value in values if value is not None]
+    return mean(numeric) if numeric else None
+
+
+def max_optional(values: Iterable[object]) -> float | None:
+    numeric = [float(value) for value in values if value is not None]
+    return max(numeric) if numeric else None
 
 
 if __name__ == "__main__":
