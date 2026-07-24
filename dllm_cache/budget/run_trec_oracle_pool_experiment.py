@@ -24,6 +24,9 @@ class TrecOraclePoolConfig:
     data_path: Path
     output_root: Path
     budgets: list[int]
+    active_budget: int | None
+    refresh_interval: int
+    score_until_newline: bool
     n_samples: int
     device: str
     dtype: torch.dtype
@@ -41,6 +44,9 @@ def parse_args() -> TrecOraclePoolConfig:
     parser.add_argument("--data", type=Path, required=True)
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--budgets", nargs="+", type=int, default=[1024, 512, 128])
+    parser.add_argument("--active-budget", type=int, default=None)
+    parser.add_argument("--refresh-interval", type=int, default=1)
+    parser.add_argument("--score-until-newline", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--n-samples", type=int, default=0)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--dtype", choices=["bfloat16", "float16", "float32"], default="bfloat16")
@@ -56,6 +62,9 @@ def parse_args() -> TrecOraclePoolConfig:
         data_path=args.data,
         output_root=args.output_root,
         budgets=args.budgets,
+        active_budget=args.active_budget,
+        refresh_interval=args.refresh_interval,
+        score_until_newline=args.score_until_newline,
         n_samples=args.n_samples,
         device=args.device,
         dtype=parse_dtype(args.dtype),
@@ -83,14 +92,17 @@ def main() -> int:
         if data is None:
             raise RuntimeError(f"missing TREC data row for sample_id={sample_id}")
         for budget in config.budgets:
-            key = (sample_id, budget)
+            active_budget = resolve_active_budget(budget, config)
+            key = (sample_id, budget, active_budget, config.refresh_interval)
             if key in done:
                 continue
             row = run_one(model, tokenizer, rec, data, record_path, budget, config)
             append_jsonl(samples_path, row)
             done.add(key)
+            mode = "pool-active" if row["inner_active_selection"] else "token-prune"
             print(
-                f"[trec-oracle-token-prune {index}/{len(records)}] budget={budget} "
+                f"[trec-oracle-{mode} {index}/{len(records)}] pool={budget} active={row['active_budget']} "
+                f"T={row['refresh_interval']} "
                 f"score={row['score']:.4f} elapsed={row['elapsed_seconds']:.2f}s "
                 f"reduced_prompt={row['reduced_prompt_length']}",
                 flush=True,
@@ -120,15 +132,23 @@ def load_trec_data(path: Path) -> dict[str, dict]:
     return rows
 
 
-def load_done(samples_path: Path) -> set[tuple[str, int]]:
-    done: set[tuple[str, int]] = set()
+def load_done(samples_path: Path) -> set[tuple[str, int, int, int]]:
+    done: set[tuple[str, int, int, int]] = set()
     if not samples_path.exists():
         return done
     with samples_path.open("r", encoding="utf-8") as handle:
         for line in handle:
             row = json.loads(line)
-            done.add((str(row["sample_id"]), int(row["budget"])))
+            budget = int(row["budget"])
+            active_budget = int(row.get("active_budget", budget))
+            refresh_interval = int(row.get("refresh_interval", 1))
+            done.add((str(row["sample_id"]), budget, active_budget, refresh_interval))
     return done
+
+
+def resolve_active_budget(budget: int, config: TrecOraclePoolConfig) -> int:
+    active_budget = budget if config.active_budget is None else int(config.active_budget)
+    return max(1, min(active_budget, budget))
 
 
 @torch.inference_mode()
@@ -145,11 +165,12 @@ def run_one(
         raise RuntimeError(f"teacher record lacks future_frequency: {record_path}")
     input_ids = rec["prompt_input_ids"].unsqueeze(0).to(config.device)
     teacher_scores = rec["future_frequency"].float()
+    active_budget = resolve_active_budget(budget, config)
     prompt_cache = build_pool_active_prompt_kv_cache(
         model,
         input_ids,
         pool_budget=budget,
-        active_budget=budget,
+        active_budget=active_budget,
         teacher_scores=teacher_scores,
         selection_mode=config.selection_mode,
     )
@@ -162,33 +183,42 @@ def run_one(
         steps=config.steps,
         gen_length=config.gen_length,
         block_length=config.block_length,
-        refresh_interval=1,
+        refresh_interval=config.refresh_interval,
         temperature=0.0,
         mask_id=config.mask_id,
     )
     torch.cuda.synchronize() if input_ids.device.type == "cuda" else None
     elapsed = time.perf_counter() - t0
     prediction = tokenizer.batch_decode(output_ids, skip_special_tokens=True)[0].strip()
+    prediction_for_score = prediction.split("\n", 1)[0].strip() if config.score_until_newline else prediction
     answers = parse_answers(data.get("answers"))
     answer = answers[0]
     all_classes = parse_all_classes(data.get("all_classes"))
-    score = classification_score(prediction, answer, all_classes)
+    score = classification_score(prediction_for_score, answer, all_classes)
+    raw_score = classification_score(prediction, answer, all_classes)
     union_size = rec.get("future_union_size_by_layer")
     return {
         "sample_id": str(rec["sample_id"]),
         "teacher_record": str(record_path),
         "budget": int(budget),
+        "pool_budget": int(budget),
+        "active_budget": int(active_budget),
+        "refresh_interval": int(config.refresh_interval),
         "selection_mode": config.selection_mode,
         "prompt_length": int(rec["prompt_length"]),
         "reduced_prompt_length": int(prompt_cache.reduced_prompt_length),
-        "inner_active_selection": False,
+        "inner_active_selection": bool(active_budget < budget),
+        "active_selection_frequency": "every_step",
         "teacher_target": "future_frequency_from_per_step_top128",
         "gen_length": int(config.gen_length),
         "steps": int(config.steps),
         "answer": answer,
         "prediction": prediction,
+        "prediction_for_score": prediction_for_score,
+        "score_until_newline": bool(config.score_until_newline),
         "score": float(score),
         "classification_score": float(score),
+        "raw_64_token_classification_score": float(raw_score),
         "union_size_mean": float(union_size.float().mean().item()) if torch.is_tensor(union_size) else None,
         "elapsed_seconds": float(elapsed),
     }
@@ -235,6 +265,9 @@ def write_summary(samples_path: Path, config: TrecOraclePoolConfig) -> None:
         "teacher_root": str(config.teacher_root),
         "data_path": str(config.data_path),
         "budgets": config.budgets,
+        "active_budget": config.active_budget,
+        "refresh_interval": config.refresh_interval,
+        "score_until_newline": config.score_until_newline,
         "selection_mode": config.selection_mode,
         "n_samples_requested": config.n_samples,
         "rows": len(rows),
@@ -242,6 +275,9 @@ def write_summary(samples_path: Path, config: TrecOraclePoolConfig) -> None:
             str(budget): {
                 "count": len(values),
                 "score_mean": mean(float(row["score"]) for row in values),
+                "raw_64_token_classification_score_mean": mean(
+                    float(row.get("raw_64_token_classification_score", row["score"])) for row in values
+                ),
                 "elapsed_seconds_mean": mean(float(row["elapsed_seconds"]) for row in values),
                 "reduced_prompt_length_mean": mean(float(row["reduced_prompt_length"]) for row in values),
             }

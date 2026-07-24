@@ -254,7 +254,7 @@ def run_pool_active_block(
     prompt_att = F.scaled_dot_product_attention(q_heads[:, :, :suffix_start, :], prompt_key, prompt_value, dropout_p=0.0, is_causal=False)
     suffix_att = F.scaled_dot_product_attention(q_heads[:, :, suffix_start:, :], suffix_key, suffix_value, dropout_p=0.0, is_causal=False)
     att = torch.cat([prompt_att, suffix_att], dim=2)
-    prompt_cache.add_layer(layer_id, active_k, active_v)
+    prompt_cache.add_layer(layer_id, pool_k, pool_v)
     x = x + block.dropout(block.attn_out(att.transpose(1, 2).contiguous().view(x.shape[0], x.shape[1], x.shape[2])))
     return run_block_mlp(block, x)
 
@@ -277,6 +277,19 @@ def select_active_offsets(
     return pool_offsets.index_select(0, active).sort().values
 
 
+def select_active_pool_positions(
+    suffix_q: torch.Tensor,
+    pool_k: torch.Tensor,
+    active_budget: int,
+) -> torch.Tensor:
+    active_count = min(max(1, active_budget), int(pool_k.shape[2]))
+    if active_count == int(pool_k.shape[2]):
+        return torch.arange(pool_k.shape[2], device=pool_k.device, dtype=torch.long)
+    scores = torch.matmul(suffix_q.float(), pool_k.float().transpose(-1, -2)) / math.sqrt(float(suffix_q.shape[-1]))
+    pool_rank = scores.mean(dim=(0, 1, 2))
+    return torch.topk(pool_rank, k=active_count, largest=True).indices.sort().values
+
+
 def run_cached_pool_active_block(
     block: nn.Module,
     x: torch.Tensor,
@@ -290,8 +303,11 @@ def run_cached_pool_active_block(
         v_heads = repeat_heads(v_heads, q_heads.shape[1])
     layer_id = int(getattr(block, "layer_id"))
     layer_cache = prompt_cache.layer(layer_id, x.device, k_heads.dtype)
-    key = torch.cat([layer_cache.key, k_heads], dim=2)
-    value = torch.cat([layer_cache.value, v_heads], dim=2)
+    active_positions = select_active_pool_positions(q_heads, layer_cache.key, prompt_cache.active_budget)
+    active_key = layer_cache.key.index_select(dim=2, index=active_positions)
+    active_value = layer_cache.value.index_select(dim=2, index=active_positions)
+    key = torch.cat([active_key, k_heads], dim=2)
+    value = torch.cat([active_value, v_heads], dim=2)
     att = F.scaled_dot_product_attention(q_heads, key, value, dropout_p=0.0, is_causal=False)
     x = x + block.dropout(block.attn_out(att.transpose(1, 2).contiguous().view(x.shape[0], x.shape[1], x.shape[2])))
     return run_block_mlp(block, x)
