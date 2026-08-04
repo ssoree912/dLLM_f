@@ -1,0 +1,30 @@
+experiment: step_distill_2wikimqa_teacher_v1
+seed: 4090
+
+model:
+  path: ${MODEL_PATH}
+  dtype: bfloat16
+  device: cuda:0
+  max_length: 2048
+
+task:
+  name: 2wikimqa
+  train_data: ${DATA_PATH}
+  output_root: ${OUTPUT_ROOT}
+  gen_length: 32
+  steps: 32
+  block_length: 8
+
+teacher:
+  confidence_weight: true
+  context_timing: pre_step
+  context_pool: all_committed_current_layer_input_mean
+  initial_context: exact_question_span_mean
+  max_target_k: 512
+  diversity_gamma: 0.1
+  similarity_source: prompt_prefill_hidden
+  teacher_kind: causal_step_distill_v1
+
+evaluation:
+  budgets: [512, 256, 128, 64, 32]
+  strong_static_baseline: trajectory_aggregate_teacher
