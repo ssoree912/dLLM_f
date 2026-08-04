@@ -10,7 +10,8 @@ import torch
 
 from .artifact_paths import teacher_artifact_path as _teacher_artifact_path
 
-SCHEMA_VERSION: Final = 2
+SCHEMA_VERSION: Final = 3
+LEGACY_SCHEMA_VERSION: Final = 2
 TEACHER_KIND: Final = "causal_step_distill_v1"
 
 
@@ -29,8 +30,6 @@ class ShardMetadata:
     steps: int
     block_length: int
     confidence_weight: bool
-    gamma: float
-    similarity_source: str
     context_timing: str
     temperature: float = 0.0
     mask_id: int = 126336
@@ -47,8 +46,6 @@ class MetadataRecord(TypedDict):
     steps: int
     block_length: int
     confidence_weight: bool
-    gamma: float
-    similarity_source: str
     context_timing: str
     temperature: float
     mask_id: int
@@ -73,7 +70,6 @@ class TeacherShardRecord(TypedDict):
     commit_confidence: torch.Tensor
     context_pre: torch.Tensor
     top_order: torch.Tensor
-    diverse_order: torch.Tensor
     candidate_scores: torch.Tensor
     metadata: MetadataRecord
 
@@ -91,7 +87,6 @@ class TeacherShard:
     commit_confidence: torch.Tensor
     context_pre: torch.Tensor
     top_order: torch.Tensor
-    diverse_order: torch.Tensor
     candidate_scores: torch.Tensor
     metadata: ShardMetadata
 
@@ -117,7 +112,6 @@ class TeacherShard:
             commit_confidence=self.commit_confidence.cpu(),
             context_pre=self.context_pre.cpu(),
             top_order=self.top_order.cpu(),
-            diverse_order=self.diverse_order.cpu(),
             candidate_scores=self.candidate_scores.cpu(),
             metadata=MetadataRecord(**asdict(self.metadata)),
         )
@@ -144,7 +138,7 @@ def save_teacher_shard_atomic(shard: TeacherShard, path: Path) -> None:
 def load_teacher_shard(
     path: Path, *, expected_sample_id: str | None = None
 ) -> TeacherShard:
-    """Load a tensor-only schema-v2 shard and reject stale or malformed content."""
+    """Load a plain per-step shard and reject stale or malformed content."""
     record = torch.load(path, map_location="cpu", weights_only=True)
     if not isinstance(record, dict):
         raise SchemaError(f"shard must be a mapping, got {type(record).__name__}")
@@ -161,16 +155,21 @@ def teacher_artifact_path(output_root: Path, dataset: str, sample_id: str) -> Pa
 
 
 def _shard_from_record(record) -> TeacherShard:
-    if record.get("schema_version") != SCHEMA_VERSION:
+    schema_version = record.get("schema_version")
+    if schema_version not in (LEGACY_SCHEMA_VERSION, SCHEMA_VERSION):
         raise SchemaError(
-            f"unsupported schema version: {record.get('schema_version')!r}"
+            f"unsupported schema version: {schema_version!r}"
         )
     if record.get("teacher_kind") != TEACHER_KIND:
         raise SchemaError(f"unsupported teacher kind: {record.get('teacher_kind')!r}")
     metadata = record.get("metadata")
     if not isinstance(metadata, dict):
         raise SchemaError(f"metadata must be a mapping, got {type(metadata).__name__}")
-    parsed_metadata = ShardMetadata(**metadata)
+    metadata_fields = dict(metadata)
+    if schema_version == LEGACY_SCHEMA_VERSION:
+        metadata_fields.pop("gamma", None)
+        metadata_fields.pop("similarity_source", None)
+    parsed_metadata = ShardMetadata(**metadata_fields)
     try:
         return TeacherShard(
             sample_id=record["sample_id"],
@@ -184,7 +183,6 @@ def _shard_from_record(record) -> TeacherShard:
             commit_confidence=record["commit_confidence"],
             context_pre=record["context_pre"],
             top_order=record["top_order"],
-            diverse_order=record["diverse_order"],
             candidate_scores=record["candidate_scores"],
             metadata=parsed_metadata,
         )
@@ -211,15 +209,14 @@ def _validate_shard(shard: TeacherShard) -> None:
         shard.commit_confidence,
         shard.context_pre,
         shard.top_order,
-        shard.diverse_order,
         shard.candidate_scores,
     )
     if any(tensor.shape[0] != step_count for tensor in step_tensors):
         raise SchemaError("all trajectory tensors must share the step axis")
     if shard.context_pre.ndim != 3:
         raise SchemaError("context_pre must have shape [step, layer, hidden]")
-    if shard.top_order.ndim != 3 or shard.diverse_order.shape != shard.top_order.shape:
-        raise SchemaError("top and diverse orders must share shape [step, layer, k]")
+    if shard.top_order.ndim != 3:
+        raise SchemaError("top_order must have shape [step, layer, k]")
     if shard.candidate_scores.shape != shard.top_order.shape:
         raise SchemaError("candidate_scores must align with top_order")
     if (
@@ -247,8 +244,6 @@ def _validate_shard(shard: TeacherShard) -> None:
         raise SchemaError("question indices fall outside the prompt")
     if shard.top_order.min() < 0 or shard.top_order.max() >= prompt_length:
         raise SchemaError("top order contains an invalid prompt index")
-    if shard.diverse_order.min() < 0 or shard.diverse_order.max() >= prompt_length:
-        raise SchemaError("diverse order contains an invalid prompt index")
     max_commits = shard.commit_positions.shape[1]
     for step_id, count_tensor in enumerate(shard.commit_counts):
         count = int(count_tensor)

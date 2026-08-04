@@ -62,7 +62,6 @@ class ExtractConfig:
     temperature: float
     confidence_weight: bool
     max_target_k: int
-    diversity_gamma: float
     seed: int
     mask_id: int
 
@@ -73,8 +72,6 @@ class ExtractConfig:
             steps=self.steps,
             block_length=self.block_length,
             confidence_weight=self.confidence_weight,
-            gamma=self.diversity_gamma,
-            similarity_source="prompt_prefill_hidden",
             context_timing="pre_step",
             temperature=self.temperature,
             mask_id=self.mask_id,
@@ -105,7 +102,6 @@ def build_teacher_shard(
         commit_confidence=result.commit_confidence.to(torch.float16),
         context_pre=result.context_pre.to(torch.float16),
         top_order=result.top_order.to(torch.long),
-        diverse_order=result.diverse_order.to(torch.long),
         candidate_scores=result.candidate_scores.to(torch.float16),
         metadata=metadata,
     )
@@ -130,7 +126,6 @@ def run_extraction(config: ExtractConfig) -> int:
         temperature=config.temperature,
         confidence_weight=config.confidence_weight,
         max_target_k=config.max_target_k,
-        diversity_gamma=config.diversity_gamma,
         mask_id=config.mask_id,
     )
     metadata = config.metadata()
@@ -223,7 +218,6 @@ def parse_args(argv: Sequence[str] | None = None) -> ExtractConfig:
     )
     parser.set_defaults(confidence_weight=True)
     parser.add_argument("--max-target-k", type=int, default=512)
-    parser.add_argument("--diversity-gamma", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=4090)
     parser.add_argument("--mask-id", type=int, default=126336)
     args = parser.parse_args(argv)
@@ -242,7 +236,6 @@ def parse_args(argv: Sequence[str] | None = None) -> ExtractConfig:
         temperature=args.temperature,
         confidence_weight=args.confidence_weight,
         max_target_k=args.max_target_k,
-        diversity_gamma=args.diversity_gamma,
         seed=args.seed,
         mask_id=args.mask_id,
     )

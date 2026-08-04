@@ -36,7 +36,6 @@ class PerStepTeacherConfig:
     temperature: float
     confidence_weight: bool
     max_target_k: int
-    diversity_gamma: float
     mask_id: int = 126336
 
     def __post_init__(self) -> None:
@@ -51,13 +50,9 @@ class PerStepTeacherConfig:
             raise TeacherGenerationError(
                 "steps must be divisible by the number of blocks"
             )
-        if (
-            self.temperature < 0.0
-            or self.max_target_k <= 0
-            or self.diversity_gamma < 0.0
-        ):
+        if self.temperature < 0.0 or self.max_target_k <= 0:
             raise TeacherGenerationError(
-                "temperature, max_target_k, and gamma must be non-negative"
+                "temperature must be non-negative and max_target_k must be positive"
             )
 
 
@@ -71,7 +66,6 @@ class PerStepTeacherResult:
     context_pre: torch.Tensor
     step_scores: torch.Tensor
     top_order: torch.Tensor
-    diverse_order: torch.Tensor
     candidate_scores: torch.Tensor
 
 
@@ -96,9 +90,6 @@ def generate_per_step_teacher(
     blocks = find_transformer_blocks(model)
     layer_count = len(blocks)
     prompt_length = int(prompt_ids.shape[1])
-    prefill = _forward_model(model, prompt_ids)
-    similarity_hidden = _layer_inputs(prefill, layer_count)
-
     suffix_ids = torch.full(
         (1, config.gen_length),
         config.mask_id,
@@ -167,11 +158,9 @@ def generate_per_step_teacher(
         collector.restore()
 
     step_scores = torch.stack(score_steps)
-    top_order, diverse_order, candidate_scores = rank_targets(
+    top_order, candidate_scores = rank_targets(
         step_scores,
-        similarity_hidden,
         max_k=config.max_target_k,
-        gamma=config.diversity_gamma,
     )
     commit_positions, commit_confidence = pad_commits(position_steps, confidence_steps)
     commit_counts = torch.tensor(
@@ -186,7 +175,6 @@ def generate_per_step_teacher(
         context_pre=torch.stack(context_steps).detach().cpu().float(),
         step_scores=step_scores.detach().cpu().float(),
         top_order=top_order,
-        diverse_order=diverse_order,
         candidate_scores=candidate_scores,
     )
 

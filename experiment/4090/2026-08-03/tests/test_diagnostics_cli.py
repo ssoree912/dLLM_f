@@ -24,4 +24,4 @@ def test_oracle_diagnostics_cli_exposes_real_shard_inputs() -> None:
     # Then
     assert completed.returncode == 0
     assert "--input-root" in completed.stdout
-    assert "--order-kind" in completed.stdout
+    assert "--order-kind" not in completed.stdout

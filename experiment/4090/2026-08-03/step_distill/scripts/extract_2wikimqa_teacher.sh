@@ -3,7 +3,7 @@ set -euo pipefail
 
 : "${MODEL_PATH:?Set MODEL_PATH to the LLaDA-8B-Instruct checkpoint}"
 : "${DATA_PATH:?Set DATA_PATH to the original 2Wiki train JSONL}"
-: "${OUTPUT_ROOT:?Set OUTPUT_ROOT for schema-v2 shards}"
+: "${OUTPUT_ROOT:?Set OUTPUT_ROOT for schema-v3 shards}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 EXPERIMENT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
@@ -22,5 +22,4 @@ export PYTHONPATH="${EXPERIMENT_ROOT}:${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
   --steps "${STEPS:-32}" \
   --block-length "${BLOCK_LENGTH:-8}" \
   --max-target-k "${MAX_TARGET_K:-512}" \
-  --diversity-gamma "${DIVERSITY_GAMMA:-0.1}" \
   --seed "${SEED:-4090}"

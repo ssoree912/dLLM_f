@@ -12,7 +12,6 @@ trajectory to one `[layer, prompt]` score. This implementation retains the step 
 context_pre      [step, layer, hidden]
 commit_positions [step, max_commit]
 top_order        [step, layer, max_target_k]
-diverse_order    [step, layer, max_target_k]
 candidate_scores [step, layer, max_target_k]
 ```
 
@@ -20,6 +19,19 @@ Each target is computed from the pre-commit attention rows of the positions sele
 When confidence weighting is enabled, confidence is normalized inside the step rather than over
 the full trajectory. Step zero uses the exact tokenized question span; later steps pool only suffix
 positions that were committed before the current forward.
+
+The main distillation path is plain per-step relevance. For every denoising step `t`, the full
+teacher forms
+
+```text
+s[t,l,i] = sum(j in S_t) normalized_confidence[t,j] * attention[t,l,j->i]
+```
+
+and stores `top_order[t,l] = argsort_i(s[t,l,i])`. The student input is the causal
+`context_pre[t,l]`; its positive target at budget `B` is exactly `top_order[t,l,:B]`. There is no
+MMR or cosine-redundancy term. At correctness-path inference the student predicts a new layer-wise
+plain Top-B mask at every denoising step. Physical KV refresh and its interval `R` are a later cache
+optimization and do not change this per-step learning target.
 
 This artifact is an **offline full-context per-step attention proxy**. It is suitable for temporal
 diagnostics and student targets on the recorded trajectory. It is not the final adaptive ceiling
@@ -97,7 +109,7 @@ against both full context and the existing trajectory-aggregate teacher.
 These are correctness-path results on the same training rows used for teacher extraction, not
 held-out LongBench scores and not latency measurements. `full` reproduced every stored teacher
 trajectory token-for-token. Static replays step-zero order at every step; dynamic replays the
-stored order for the current step. Both use plain attention relevance without MMR.
+stored plain order for the current step.
 
 ### 2WikiMultihopQA train, 32 rows
 

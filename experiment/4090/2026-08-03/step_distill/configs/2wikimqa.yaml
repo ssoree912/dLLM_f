@@ -21,8 +21,6 @@ teacher:
   context_pool: all_committed_current_layer_input_mean
   initial_context: exact_question_span_mean
   max_target_k: 512
-  diversity_gamma: 0.1
-  similarity_source: prompt_prefill_hidden
   teacher_kind: causal_step_distill_v1
 
 evaluation:

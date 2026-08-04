@@ -102,7 +102,6 @@ def test_generate_per_step_teacher_keeps_distinct_t_targets_and_pre_states() -> 
         temperature=0.0,
         confidence_weight=True,
         max_target_k=2,
-        diversity_gamma=0.1,
         mask_id=mask_id,
     )
 

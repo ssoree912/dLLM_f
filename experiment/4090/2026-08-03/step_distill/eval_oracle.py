@@ -34,8 +34,6 @@ class EvalMethod(str, Enum):
     FULL = "full"
     STATIC_PLAIN = "static_plain"
     DYNAMIC_PLAIN = "dynamic_plain"
-    STATIC_DIVERSE = "static_diverse"
-    DYNAMIC_DIVERSE = "dynamic_diverse"
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,10 +67,6 @@ def _controller(
             mode, order = ReplayMode.STATIC, shard.top_order
         case EvalMethod.DYNAMIC_PLAIN:
             mode, order = ReplayMode.DYNAMIC, shard.top_order
-        case EvalMethod.STATIC_DIVERSE:
-            mode, order = ReplayMode.STATIC, shard.diverse_order
-        case EvalMethod.DYNAMIC_DIVERSE:
-            mode, order = ReplayMode.DYNAMIC, shard.diverse_order
         case EvalMethod.FULL:
             raise OracleEvalError("full inference does not use a replay controller")
         case unreachable:

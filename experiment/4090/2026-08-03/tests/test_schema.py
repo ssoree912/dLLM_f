@@ -26,7 +26,6 @@ def make_shard() -> TeacherShard:
         commit_confidence=torch.tensor([[0.8, 0.0], [0.7, 0.0]]),
         context_pre=torch.ones((2, 1, 4)),
         top_order=torch.tensor([[[0, 1]], [[1, 0]]]),
-        diverse_order=torch.tensor([[[0, 2]], [[1, 2]]]),
         candidate_scores=torch.tensor([[[0.8, 0.7]], [[0.9, 0.6]]]),
         metadata=ShardMetadata(
             max_length=2048,
@@ -34,8 +33,6 @@ def make_shard() -> TeacherShard:
             steps=2,
             block_length=2,
             confidence_weight=True,
-            gamma=0.1,
-            similarity_source="prompt_prefill_hidden",
             context_timing="pre_step",
         ),
     )
@@ -69,7 +66,6 @@ def test_teacher_shard_rejects_mismatched_step_axis() -> None:
             commit_confidence=shard.commit_confidence,
             context_pre=shard.context_pre,
             top_order=shard.top_order,
-            diverse_order=shard.diverse_order,
             candidate_scores=shard.candidate_scores,
             metadata=shard.metadata,
         )
@@ -87,3 +83,37 @@ def test_atomic_shard_round_trip_revalidates_content(tmp_path: Path) -> None:
     # Then
     assert loaded.sample_id == shard.sample_id
     torch.testing.assert_close(loaded.top_order, shard.top_order)
+
+
+def test_teacher_shard_record_omits_redundant_diversity_order() -> None:
+    # Given
+    shard = make_shard()
+
+    # When
+    record = shard.to_record()
+
+    # Then
+    assert "diverse_order" not in record
+    assert record["schema_version"] == 3
+
+
+def test_load_teacher_shard_accepts_legacy_plain_target(tmp_path: Path) -> None:
+    # Given
+    shard = make_shard()
+    record = dict(shard.to_record())
+    record["schema_version"] = 2
+    record["diverse_order"] = shard.top_order.clone()
+    record["metadata"] = {
+        **record["metadata"],
+        "gamma": 0.0,
+        "similarity_source": "prompt_prefill_hidden",
+    }
+    path = tmp_path / "legacy.pt"
+    torch.save(record, path)
+
+    # When
+    loaded = load_teacher_shard(path)
+
+    # Then
+    torch.testing.assert_close(loaded.top_order, shard.top_order)
+    assert loaded.metadata == shard.metadata

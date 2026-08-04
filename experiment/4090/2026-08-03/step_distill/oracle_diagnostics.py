@@ -6,10 +6,8 @@ from collections.abc import Sequence
 from dataclasses import asdict, dataclass
 from itertools import pairwise
 from pathlib import Path
-from typing import Literal
 
 import torch
-from typing_extensions import assert_never
 
 from .schema import load_teacher_shard
 
@@ -33,7 +31,6 @@ class TemporalMetrics:
 @dataclass(frozen=True, slots=True)
 class DiagnosticSummary:
     shard_count: int
-    order_kind: str
     budget: int
     adjacent_jaccard: float
     early_late_jaccard: float
@@ -102,23 +99,16 @@ def temporal_metrics(
 def summarize_shards(
     input_root: Path,
     *,
-    order_kind: Literal["top", "diverse"],
     budget: int,
 ) -> DiagnosticSummary:
-    """Load every valid schema-v2 shard and average temporal diagnostics."""
+    """Load every valid shard and average plain top-order diagnostics."""
     paths = sorted(input_root.rglob("*.pt"))
     if not paths:
         raise DiagnosticError(f"no .pt shards found below {input_root}")
     metrics: list[TemporalMetrics] = []
     for path in paths:
         shard = load_teacher_shard(path)
-        match order_kind:
-            case "top":
-                order = shard.top_order
-            case "diverse":
-                order = shard.diverse_order
-            case unreachable:
-                assert_never(unreachable)
+        order = shard.top_order
         selected_budget = effective_budget(
             requested=budget,
             prompt_length=int(shard.prompt_input_ids.numel()),
@@ -133,7 +123,6 @@ def summarize_shards(
         )
     return DiagnosticSummary(
         shard_count=len(metrics),
-        order_kind=order_kind,
         budget=budget,
         adjacent_jaccard=sum(item.adjacent_jaccard for item in metrics) / len(metrics),
         early_late_jaccard=sum(item.early_late_jaccard for item in metrics)
@@ -145,16 +134,14 @@ def summarize_shards(
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Measure temporal change in schema-v2 teacher masks."
+        description="Measure temporal change in plain per-step teacher masks."
     )
     parser.add_argument("--input-root", type=Path, required=True)
-    parser.add_argument("--order-kind", choices=["top", "diverse"], default="diverse")
     parser.add_argument("--budget", type=int, required=True)
     parser.add_argument("--output", type=Path)
     args = parser.parse_args(argv)
     summary = summarize_shards(
         args.input_root,
-        order_kind=args.order_kind,
         budget=args.budget,
     )
     payload = json.dumps(asdict(summary), indent=2, sort_keys=True)
