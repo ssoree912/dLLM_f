@@ -17,6 +17,15 @@ def rouge_l_score(prediction: str, ground_truth: str) -> float:
     return 2.0 * precision * recall / (precision + recall)
 
 
+def rouge_l_recall(prediction: str, ground_truth: str) -> float:
+    """Compute word-level LCS recall without a generated-length penalty."""
+    predicted = re.findall(r"\w+", prediction.lower())
+    reference = re.findall(r"\w+", ground_truth.lower())
+    if not reference:
+        return float(not predicted)
+    return _lcs_length(predicted, reference) / len(reference)
+
+
 def _lcs_length(left: list[str], right: list[str]) -> int:
     previous = [0] * (len(right) + 1)
     for left_token in left:

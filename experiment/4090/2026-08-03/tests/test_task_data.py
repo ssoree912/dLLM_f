@@ -6,6 +6,7 @@ from pathlib import Path
 from step_distill.schema import teacher_artifact_path
 from step_distill.task_data import (
     SAMSUM_INSTRUCTION,
+    SamsumStateSpan,
     TeacherSample,
     load_teacher_samples,
     tokenize_2wiki_prompt,
@@ -69,7 +70,7 @@ def test_teacher_artifact_path_is_collision_safe_and_stays_under_root(
     assert second.parent == tmp_path / "2wikimqa"
 
 
-def test_tokenize_samsum_prompt_uses_summary_instruction_as_query_feature() -> None:
+def test_tokenize_samsum_prompt_preserves_legacy_instruction_feature() -> None:
     # Given
     sample = TeacherSample(
         sample_id="dialogue-1",
@@ -95,6 +96,39 @@ def test_tokenize_samsum_prompt_uses_summary_instruction_as_query_feature() -> N
         f"{SAMSUM_INSTRUCTION}\n\n{sample.context}\n\n{sample.question}"
     )
     assert query_feature == SAMSUM_INSTRUCTION
+
+
+def test_samsum_initial_state_never_uses_retained_instruction_fragment() -> None:
+    # Given
+    sample = TeacherSample(
+        sample_id="dialogue-2",
+        dataset="samsum",
+        question="Dialogue: A: Ready?\nB: Yes.\nSummary: ",
+        context="x" * 80,
+        answer="A asks whether B is ready.",
+    )
+
+    # When
+    tokenized = tokenize_samsum_prompt(
+        CharacterTokenizer(),
+        sample,
+        max_length=24,
+        reserve_length=8,
+        state_span=SamsumStateSpan.TARGET_REQUEST,
+    )
+    legacy = tokenize_samsum_prompt(
+        CharacterTokenizer(),
+        sample,
+        max_length=24,
+        reserve_length=8,
+    )
+    initial_state = "".join(
+        chr(tokenized.prompt_ids[index]) for index in tokenized.question_indices
+    )
+
+    # Then
+    assert tokenized.prompt_ids == legacy.prompt_ids
+    assert initial_state == sample.question.strip()[-16:]
 
 
 def test_load_teacher_samples_accepts_longbench_eval_input_field(

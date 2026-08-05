@@ -1,9 +1,122 @@
-# State-conditioned per-step teacher
+# State-conditioned B=960 distribution distillation
 
-This directory implements the oracle-validity stage of the step-distillation experiment without
-changing the frozen `2026-07-14` or `345/2026-07-15` experiments.
+This directory keeps the frozen `2026-07-14` and `345/2026-07-15` experiments unchanged. The
+current student experiment has one budget and one question:
 
-## What changed
+\[
+\boxed{B=960:\quad
+p_{\mathrm{pruned}}(\cdot\mid x_t^\pi)
+\approx p_{\mathrm{full}}(\cdot\mid x_t^\pi)}
+\]
+
+`B=480`, a budget embedding, MMR, and physical KV refresh are outside this experiment.
+
+## Online teacher and causal state
+
+The rollout state contains the unchanged prompt, committed suffix tokens, and remaining masks.
+Both forwards receive the identical current pruned state `x_t^pi`:
+
+\[
+z_t^F=F(x_t^\pi;\mathbf 1_P),\qquad
+z_t^\pi=F(x_t^\pi;M_t^\theta).
+\]
+
+The full pass runs without gradients. Both passes use the same explicit fp32 attention operator;
+the full pass applies an all-one prompt gate and the pruned pass applies Top-960. Thus the prompt
+gate is their only attention-path difference. The pruned pass keeps the decoder frozen but retains
+the gradient to the selector. The next state always commits the pruned candidates, never teacher
+tokens:
+
+\[
+x_{t+1}^\pi=\operatorname{Commit}(x_t^\pi,z_t^\pi).
+\]
+
+Prompt-only layer inputs provide fixed token features `r[l,i]`. Before each step, the causal state
+summary uses only token IDs already known at that point:
+
+\[
+c_t=\operatorname{mean}_{j:x_{t,j}^\pi\ne[\mathrm{MASK}]}
+E(x_{t,j}^\pi).
+\]
+
+At step zero, where that set is empty, `c_0` pools the final target dialogue/request span. It never
+uses a partially retained fragment of the shared few-shot instruction. The shared selector is
+
+\[
+u_{l,i}=P_{tok}(r_{l,i}),\quad v_t=P_c(c_t),
+\]
+
+\[
+a_{t,l,i}=\operatorname{MLP}
+([u_{l,i};v_t;u_{l,i}\odot v_t;e_l]),\qquad
+M_{t,l}^\theta=\operatorname{Top960}_i(a_{t,l,i}).
+\]
+
+There is no budget input because 960 is the only supported training budget.
+
+## Straight-through hard pruning
+
+An additive `-1e4` mask is not used: it gives discarded keys zero attention and therefore zero
+selector gradient. Instead, attention probabilities are gated after softmax and renormalized. With
+
+\[
+m^{ST}=m^{soft}+\operatorname{stopgrad}(m^{hard}-m^{soft}),
+\]
+
+the training attention is
+
+\[
+\widetilde A_{q,i}=
+\frac{A_{q,i}m_i^{ST}}{\sum_k A_{q,k}m_k^{ST}}.
+\]
+
+Its forward value is exactly the hard Top-960 attention result, while the backward relaxation also
+reaches tokens outside the current Top-960. Training still computes dense QK scores to obtain this
+surrogate gradient. Sparse latency or memory reduction is therefore measured later with the
+integer-gather inference path, not with this training forward.
+
+## Objective
+
+For the uncommitted positions `U_t`, temperature `tau`, and full-teacher commit positions `S_t^F`:
+
+\[
+\mathcal L_{KD}=\frac{1}{|U_t|}\sum_{j\in U_t}
+(1+\beta\mathbf 1[j\in S_t^F])\tau^2
+D_{KL}(p^F_{t,j}\Vert p^\pi_{t,j}).
+\]
+
+Commit ranking compares `S_t^F` only with other uncommitted positions in the active generation
+block, because future blocks are not eligible for the current decoder commit:
+
+\[
+\mathcal L=\mathcal L_{KD}+\lambda_{commit}\mathcal L_{commit}.
+\]
+
+The recorded per-step diagnostics separate the unweighted full-to-pruned KL from the
+commit-weighted KD training loss, together with token top-1 agreement, commit-position Jaccard,
+and selector gradient norm. A complete validation rollout additionally records both raw-canvas and
+EOS/EOT-truncated predictions, ROUGE-L F1/LCS recall, first-stop position, tokens before stop, and
+trailing-token count.
+
+## SAMSum split and first run
+
+Optimization uses only the prepared SAMSum train subset; validation is held out and never passed
+to the optimizer. The default CLI uses 8 train and 8 validation samples, 128 denoising steps, and
+`B=960`:
+
+```bash
+uv run --python /path/to/torch/python --with 'pydantic>=2,<3' \
+  python -m step_distill.train_distribution_student \
+  --model /path/to/LLaDA-8B-Instruct \
+  --train-data /path/to/samsum_train_fewshot_2048.jsonl.xz \
+  --validation-data /path/to/samsum_validation_fewshot_2048.jsonl.xz \
+  --output-dir /path/to/distribution_b960
+```
+
+Use `--max-rollout-steps 1` only for an implementation smoke. Omitting it runs the complete
+trajectory and enables downstream summary metrics.
+
+## Offline attention-teacher diagnostics
 
 The existing full-dynamic teacher observes every denoising step but collapses the complete
 trajectory to one `[layer, prompt]` score. This implementation retains the step axis:
@@ -20,22 +133,19 @@ When confidence weighting is enabled, confidence is normalized inside the step r
 the full trajectory. Step zero uses the exact tokenized question span; later steps pool only suffix
 positions that were committed before the current forward.
 
-The main distillation path is plain per-step relevance. For every denoising step `t`, the full
+The earlier attention diagnostic uses plain per-step relevance. For every denoising step `t`, the full
 teacher forms
 
 ```text
 s[t,l,i] = sum(j in S_t) normalized_confidence[t,j] * attention[t,l,j->i]
 ```
 
-and stores `top_order[t,l] = argsort_i(s[t,l,i])`. The student input is the causal
-`context_pre[t,l]`; its positive target at budget `B` is exactly `top_order[t,l,:B]`. There is no
-MMR or cosine-redundancy term. At correctness-path inference the student predicts a new layer-wise
-plain Top-B mask at every denoising step. Physical KV refresh and its interval `R` are a later cache
-optimization and do not change this per-step learning target.
+and stores `top_order[t,l] = argsort_i(s[t,l,i])`. There is no MMR or cosine-redundancy term. These
+orders remain offline/online attention baselines; they are not labels for the distribution student.
 
 This artifact is an **offline full-context per-step attention proxy**. It is suitable for temporal
-diagnostics and student targets on the recorded trajectory. It is not the final adaptive ceiling
-when pruning changes the generated trajectory; that requires the planned online two-pass replay.
+diagnostics on the recorded trajectory. The online two-pass distribution teacher above removes its
+stale-trajectory limitation.
 
 ## Evaluation output boundary
 

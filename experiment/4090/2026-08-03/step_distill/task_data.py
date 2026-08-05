@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import lzma
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from typing import Protocol, TypeAlias, TypedDict
 
@@ -62,15 +63,19 @@ class TokenizedPrompt:
     truncation_offset: int
 
 
+class SamsumStateSpan(str, Enum):
+    SHARED_INSTRUCTION = "shared_instruction"
+    TARGET_REQUEST = "target_request"
+
+
 def load_teacher_samples(path: Path, *, limit: int = 0) -> list[TeacherSample]:
     """Load original-task training rows represented in the local unified JSONL schema."""
     samples: list[TeacherSample] = []
-    handle = (
+    with (
         lzma.open(path, mode="rt", encoding="utf-8")
         if path.suffix == ".xz"
         else path.open("r", encoding="utf-8")
-    )
-    with handle:
+    ) as handle:
         for index, line in enumerate(handle):
             if limit > 0 and len(samples) >= limit:
                 break
@@ -140,8 +145,9 @@ def tokenize_samsum_prompt(
     *,
     max_length: int,
     reserve_length: int,
+    state_span: SamsumStateSpan = SamsumStateSpan.SHARED_INSTRUCTION,
 ) -> TokenizedPrompt:
-    """Use the LongBench SAMSum template and track its summary instruction span."""
+    """Use the LongBench template and explicitly choose the static state span."""
     if max_length <= reserve_length:
         raise DataError("max_length must exceed reserve_length")
     dialogue = sample.context.strip()
@@ -159,29 +165,57 @@ def tokenize_samsum_prompt(
     prompt_cap = max_length - reserve_length
     truncation_offset = max(0, len(prompt_ids_full) - prompt_cap)
     prompt_ids = prompt_ids_full[truncation_offset:]
+    match state_span:
+        case SamsumStateSpan.SHARED_INSTRUCTION:
+            span_indices = _retained_instruction_indices(
+                offsets,
+                truncation_offset,
+                prompt_text,
+                request,
+            )
+        case SamsumStateSpan.TARGET_REQUEST:
+            request_start = len(prompt_text) - len(request)
+            span_indices = [
+                token_index - truncation_offset
+                for token_index, (start, end) in enumerate(offsets)
+                if token_index >= truncation_offset
+                and start < len(prompt_text)
+                and end > request_start
+            ]
+        case unreachable:
+            assert_never(unreachable)
+    if not span_indices:
+        raise DataError("left truncation removed the selected SAMSum state span")
+    return TokenizedPrompt(
+        prompt_text=prompt_text,
+        prompt_ids=prompt_ids,
+        question_indices=torch.tensor(span_indices, dtype=torch.long),
+        truncation_offset=truncation_offset,
+    )
+
+
+def _retained_instruction_indices(
+    offsets: list[tuple[int, int]],
+    truncation_offset: int,
+    prompt_text: str,
+    request: str,
+) -> list[int]:
     instruction_end = len(SAMSUM_INSTRUCTION)
-    retained_instruction = [
+    retained = [
         token_index - truncation_offset
         for token_index, (start, end) in enumerate(offsets)
         if token_index >= truncation_offset and start < instruction_end and end > 0
     ]
-    if not retained_instruction:
-        request_start = len(prompt_text) - len(request)
-        retained_instruction = [
-            token_index - truncation_offset
-            for token_index, (start, end) in enumerate(offsets)
-            if token_index >= truncation_offset
-            and start < len(prompt_text)
-            and end > request_start
-        ]
-    if not retained_instruction:
-        raise DataError("left truncation removed every summary instruction span")
-    return TokenizedPrompt(
-        prompt_text=prompt_text,
-        prompt_ids=prompt_ids,
-        question_indices=torch.tensor(retained_instruction, dtype=torch.long),
-        truncation_offset=truncation_offset,
-    )
+    if retained:
+        return retained
+    request_start = len(prompt_text) - len(request)
+    return [
+        token_index - truncation_offset
+        for token_index, (start, end) in enumerate(offsets)
+        if token_index >= truncation_offset
+        and start < len(prompt_text)
+        and end > request_start
+    ]
 
 
 def _normalize_question(question: str) -> str:
