@@ -4,7 +4,7 @@ task: local_longbench_multifieldqa_en
 dataset_path: json
 dataset_kwargs:
   data_files:
-    test: /mnt/srv/home/dlpcg.325/dllm/data/longbench/multifieldqa_en.jsonl
+    test: /home/M2026107/dllm/data/longbench/multifieldqa_en.jsonl
 test_split: test
 doc_to_text: "Read the following text and answer briefly.\n\n{{context}}\n\nNow, answer the following question based on the above text, only give me the answer and do not output any other words.\n\nQuestion: {{question}}\nAnswer:"
 doc_to_target: "{{answers}}"

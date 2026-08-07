@@ -5,7 +5,7 @@ task: local_longbench_narrativeqa
 dataset_path: json
 dataset_kwargs:
   data_files:
-    test: /mnt/srv/home/dlpcg.325/dllm/data/longbench/narrativeqa.jsonl
+    test: /home/M2026107/dllm/data/longbench/narrativeqa.jsonl
 test_split: test
 doc_to_text: "You are given a story, which can be either a novel or a movie script, and a question. Answer the question asconcisely as you can, using a single phrase if possible. Do not provide any explanation.\n\nStory: {{context}}\n\nNow, answer the question based on the story asconcisely as you can, using a single phrase if possible. Do not provide any explanation.\n\nQuestion: {{input}}\n\nAnswer:"
 doc_to_target: "{{answers}}"

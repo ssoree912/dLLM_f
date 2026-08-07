@@ -4,7 +4,7 @@ task: local_longbench_qasper
 dataset_path: json
 dataset_kwargs:
   data_files:
-    test: /mnt/srv/home/dlpcg.325/dllm/data/longbench/qasper.jsonl
+    test: /home/M2026107/dllm/data/longbench/qasper.jsonl
 test_split: test
 doc_to_text: "You are given a scientific article and a question. Answer the question as concisely as you can, using a single phrase or sentence if possible. If the question cannot be answered based on the information in the article, write \"unanswerable\". If the question is a yes/no question, answer \"yes\", \"no\", or \"unanswerable\". Do not provide any explanation.\n\nArticle: {{context}}\n\n Answer the question based on the above article as concisely as you can, using a single phrase or sentence if possible. If the question cannot be answered based on the information in the article, write \"unanswerable\". If the question is a yes/no question, answer \"yes\", \"no\", or \"unanswerable\". Do not provide any explanation.\n\nQuestion: {{question}}\n\nAnswer:"
 doc_to_target: "{{answers}}"

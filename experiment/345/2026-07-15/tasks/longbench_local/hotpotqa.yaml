@@ -5,7 +5,7 @@ task: local_longbench_hotpotqa
 dataset_path: json
 dataset_kwargs:
   data_files:
-    test: /mnt/srv/home/dlpcg.325/dllm/data/longbench/hotpotqa.jsonl
+    test: /home/M2026107/dllm/data/longbench/hotpotqa.jsonl
 test_split: test
 doc_to_text: "Answer the question based on the given passages. Only give me the answer and do not output any other words.\n\nThe following are given passages.\n{{context}}\n\nAnswer the question based on the given passages. Only give me the answer and do not output any other words.\n\nQuestion: {{question}}\nAnswer:"
 doc_to_target: "{{answers}}"

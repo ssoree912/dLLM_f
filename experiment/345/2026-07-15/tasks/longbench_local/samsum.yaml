@@ -5,7 +5,7 @@ task: local_longbench_samsum
 dataset_path: json
 dataset_kwargs:
   data_files:
-    test: /mnt/srv/home/dlpcg.325/dllm/data/longbench/samsum.jsonl
+    test: /home/M2026107/dllm/data/longbench/samsum.jsonl
 test_split: test
 doc_to_text: "Summarize the dialogue into a few short sentences. The following are some examples.\n\n{{context}}\n{{input}}"
 doc_to_target: "{{answers}}"

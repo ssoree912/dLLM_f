@@ -103,6 +103,9 @@ class LLaDA(TemplateLM):
         student_prompt_kv_cache: bool = False,
         student_prompt_prune: bool = False,
         student_prompt_pool_active: bool = False,
+        student_prompt_dynamic_kv: bool = False,
+        student_selection_mode: str = "global",
+        student_refresh_interval: int = 1,
         student_budget: int = 128,
         student_pool_budget: int = 512,
         student_min_pool_budget: int = 1,
@@ -126,6 +129,13 @@ class LLaDA(TemplateLM):
         self.student_prompt_kv_cache = self._coerce_bool(student_prompt_kv_cache)
         self.student_prompt_prune = self._coerce_bool(student_prompt_prune)
         self.student_prompt_pool_active = self._coerce_bool(student_prompt_pool_active)
+        self.student_prompt_dynamic_kv = self._coerce_bool(student_prompt_dynamic_kv)
+        self.student_selection_mode = str(student_selection_mode).strip().lower()
+        if self.student_selection_mode not in {"layer_union", "global"}:
+            raise RuntimeError("student_selection_mode must be one of: layer_union, global")
+        self.student_refresh_interval = int(student_refresh_interval)
+        if self.student_refresh_interval <= 0:
+            raise RuntimeError("student_refresh_interval must be positive")
         self.student_budget = int(student_budget)
         self.student_pool_budget = int(student_pool_budget)
         self.student_min_pool_budget = int(student_min_pool_budget)
@@ -146,6 +156,7 @@ class LLaDA(TemplateLM):
                 self.student_prompt_kv_cache,
                 self.student_prompt_prune,
                 self.student_prompt_pool_active,
+                self.student_prompt_dynamic_kv,
             )
         )
         if active_student_modes > 1:
@@ -362,7 +373,12 @@ class LLaDA(TemplateLM):
                     cfg_interval_steps=cfg_interval_steps if is_cfg_cache else 1,
                 )))
 
-        if self.student_prompt_kv_cache or self.student_prompt_prune or self.student_prompt_pool_active:
+        if (
+            self.student_prompt_kv_cache
+            or self.student_prompt_prune
+            or self.student_prompt_pool_active
+            or self.student_prompt_dynamic_kv
+        ):
             if self.student_path is None:
                 raise RuntimeError("student prompt compression requires student_path")
             self.student = self._load_prompt_utility_student(self.student_path)
@@ -400,6 +416,12 @@ class LLaDA(TemplateLM):
             elif self.student_prompt_prune:
                 mode = "prune"
                 budget_text = f"budget={self.student_budget}"
+            elif self.student_prompt_dynamic_kv:
+                mode = "dynamic reduced sequence"
+                budget_text = (
+                    f"budget={self.student_budget}, selection_mode={self.student_selection_mode}, "
+                    f"refresh_interval={self.student_refresh_interval}"
+                )
             else:
                 mode = "KV cache"
                 budget_text = f"budget={self.student_budget}"
@@ -480,6 +502,40 @@ class LLaDA(TemplateLM):
         )
 
     @torch.inference_mode()
+    def _generate_with_student_dynamic_kv(self, input_ids: torch.Tensor, gen_kwargs: dict) -> torch.Tensor:
+        """Drop the unselected prompt tokens and re-forward the shortened sequence.
+
+        Unlike the frozen prompt-KV cache, the retained prompt tokens keep their
+        representations refreshed, so bidirectional attention still lets them see the
+        suffix. refresh_interval=1 recomputes them at every denoising step.
+        """
+        from dllm_cache.budget.dynamic_prompt_kv import (
+            build_dynamic_prompt_kv_cache,
+            generate_with_dynamic_prompt_kv,
+        )
+
+        student_scores = self._predict_student_scores(input_ids)
+        prompt_cache = build_dynamic_prompt_kv_cache(
+            self.model,
+            input_ids,
+            budget=self.student_budget,
+            teacher_scores=student_scores,
+            selection_mode=self.student_selection_mode,
+        )
+        return generate_with_dynamic_prompt_kv(
+            input_ids=input_ids,
+            model=self.model,
+            prompt_cache=prompt_cache,
+            steps=int(gen_kwargs.get("steps")),
+            gen_length=int(gen_kwargs.get("gen_length")),
+            block_length=int(gen_kwargs.get("block_length")),
+            refresh_interval=self.student_refresh_interval,
+            cfg_scale=float(gen_kwargs.get("cfg_scale", 0.0) or 0.0),
+            remasking=gen_kwargs.get("remasking") or "low_confidence",
+            mask_id=self.mask_id,
+        )
+
+    @torch.inference_mode()
     def _generate_with_student_prompt_prune(self, input_ids: torch.Tensor, gen_kwargs: dict) -> torch.Tensor:
         from dllm_cache.budget.oracle_prune import install_oracle_pruner
 
@@ -538,7 +594,7 @@ class LLaDA(TemplateLM):
             steps=int(gen_kwargs.get("steps")),
             gen_length=int(gen_kwargs.get("gen_length")),
             block_length=int(gen_kwargs.get("block_length")),
-            refresh_interval=1,
+            refresh_interval=self.student_refresh_interval,
             mask_id=self.mask_id,
         )
 
@@ -1042,6 +1098,8 @@ class LLaDA(TemplateLM):
             )
             if self.student_prompt_pool_active:
                 out = self._generate_with_student_prompt_pool_active(context_enc, gen_kwargs)
+            elif self.student_prompt_dynamic_kv:
+                out = self._generate_with_student_dynamic_kv(context_enc, gen_kwargs)
             elif self.student_prompt_prune:
                 out = self._generate_with_student_prompt_prune(context_enc, gen_kwargs)
             elif self.student_prompt_kv_cache:
