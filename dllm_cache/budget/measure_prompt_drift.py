@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import lzma
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -28,6 +29,7 @@ class DriftConfig:
     steps: int
     block_length: int
     repeats: int
+    question_window: int
 
 
 SAMSUM_INSTRUCTION = (
@@ -44,7 +46,12 @@ def build_prompt(row: dict) -> str:
 
 def load_rows(path: Path, limit: int) -> list[dict]:
     rows: list[dict] = []
-    with path.open("r", encoding="utf-8") as handle:
+    opener = (
+        (lambda: lzma.open(path, mode="rt", encoding="utf-8"))
+        if path.suffix == ".xz"
+        else (lambda: path.open("r", encoding="utf-8"))
+    )
+    with opener() as handle:
         for line in handle:
             if limit > 0 and len(rows) >= limit:
                 break
@@ -92,12 +99,23 @@ def run(config: DriftConfig) -> Path:
                 stats = collector.result()
             finally:
                 collector.restore()
+            # Same record shape the student trainer expects, so --target-mode drift
+            # can consume these directly.
+            window = min(config.question_window, prompt_length)
             payload = {
+                "teacher_kind": "prompt_drift",
                 "sample_id": row.get("_id", f"sample_{index}"),
                 "repeat": repeat,
                 "prompt_length": prompt_length,
                 "prompt_input_ids": prompt_ids.squeeze(0).cpu(),
-                **{name: tensor.cpu() for name, tensor in stats.items()},
+                "prompt_token_indices": torch.arange(prompt_length, dtype=torch.long),
+                "question_token_indices": torch.arange(
+                    prompt_length - window, prompt_length, dtype=torch.long
+                ),
+                "drift_cumulative": stats["cumulative"].cpu(),
+                "drift_stepwise": stats["stepwise"].cpu(),
+                "drift_attention": stats["attention"].cpu(),
+                "drift_weighted": stats["weighted"].cpu(),
             }
             path = config.output_dir / f"drift_{index:04d}_r{repeat}.pt"
             torch.save(payload, path)
@@ -129,6 +147,7 @@ def parse_args(argv: Sequence[str] | None = None) -> DriftConfig:
         default=1,
         help="generations per prompt; >1 tests whether drift reproduces",
     )
+    parser.add_argument("--question-window", type=int, default=128)
     args = parser.parse_args(argv)
     return DriftConfig(
         model_path=args.model,
@@ -142,6 +161,7 @@ def parse_args(argv: Sequence[str] | None = None) -> DriftConfig:
         steps=args.steps,
         block_length=args.block_length,
         repeats=args.repeats,
+        question_window=args.question_window,
     )
 
 
