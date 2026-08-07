@@ -104,6 +104,9 @@ class LLaDA(TemplateLM):
         student_prompt_prune: bool = False,
         student_prompt_pool_active: bool = False,
         student_prompt_dynamic_kv: bool = False,
+        student_prompt_layer_split: bool = False,
+        student_frozen_layers: int = 16,
+        student_refresh_tokens: int = 0,
         student_selection_mode: str = "global",
         student_refresh_interval: int = 1,
         student_budget: int = 128,
@@ -130,6 +133,13 @@ class LLaDA(TemplateLM):
         self.student_prompt_prune = self._coerce_bool(student_prompt_prune)
         self.student_prompt_pool_active = self._coerce_bool(student_prompt_pool_active)
         self.student_prompt_dynamic_kv = self._coerce_bool(student_prompt_dynamic_kv)
+        self.student_prompt_layer_split = self._coerce_bool(student_prompt_layer_split)
+        self.student_frozen_layers = int(student_frozen_layers)
+        if self.student_frozen_layers < 0:
+            raise RuntimeError("student_frozen_layers must be non-negative")
+        self.student_refresh_tokens = int(student_refresh_tokens)
+        if self.student_refresh_tokens < 0:
+            raise RuntimeError("student_refresh_tokens must be non-negative")
         self.student_selection_mode = str(student_selection_mode).strip().lower()
         if self.student_selection_mode not in {"layer_union", "global"}:
             raise RuntimeError("student_selection_mode must be one of: layer_union, global")
@@ -157,6 +167,7 @@ class LLaDA(TemplateLM):
                 self.student_prompt_prune,
                 self.student_prompt_pool_active,
                 self.student_prompt_dynamic_kv,
+                self.student_prompt_layer_split,
             )
         )
         if active_student_modes > 1:
@@ -378,6 +389,7 @@ class LLaDA(TemplateLM):
             or self.student_prompt_prune
             or self.student_prompt_pool_active
             or self.student_prompt_dynamic_kv
+            or self.student_prompt_layer_split
         ):
             if self.student_path is None:
                 raise RuntimeError("student prompt compression requires student_path")
@@ -416,6 +428,13 @@ class LLaDA(TemplateLM):
             elif self.student_prompt_prune:
                 mode = "prune"
                 budget_text = f"budget={self.student_budget}"
+            elif self.student_prompt_layer_split:
+                mode = "layer-split prompt cache"
+                budget_text = (
+                    f"budget={self.student_budget}, "
+                    f"frozen_layers={self.student_frozen_layers}, "
+                    f"refresh_tokens={self.student_refresh_tokens or self.student_budget}"
+                )
             elif self.student_prompt_dynamic_kv:
                 mode = "dynamic reduced sequence"
                 budget_text = (
@@ -498,6 +517,40 @@ class LLaDA(TemplateLM):
             remasking=gen_kwargs.get("remasking", None)
             if gen_kwargs.get("remasking", None)
             else "low_confidence",
+            mask_id=self.mask_id,
+        )
+
+    @torch.inference_mode()
+    def _generate_with_student_layer_split(self, input_ids: torch.Tensor, gen_kwargs: dict) -> torch.Tensor:
+        """Freeze the prompt through the shallow layers, keep refreshing it deeper.
+
+        Prompt value vectors barely move in the shallow half (0.04 relative drift by
+        layer 8) and move a lot in the deep half (0.37 by layer 24), so the shallow
+        layers can serve their prefill K/V for the whole trajectory.
+        """
+        from dllm_cache.budget.layer_split_prompt_kv import (
+            build_layer_split_prompt_cache,
+            generate_with_layer_split_prompt_kv,
+        )
+
+        student_scores = self._predict_student_scores(input_ids)
+        prompt_cache = build_layer_split_prompt_cache(
+            self.model,
+            input_ids,
+            budget=self.student_budget,
+            teacher_scores=student_scores,
+            frozen_layers=self.student_frozen_layers,
+            refresh_tokens=self.student_refresh_tokens,
+        )
+        return generate_with_layer_split_prompt_kv(
+            input_ids=input_ids,
+            model=self.model,
+            prompt_cache=prompt_cache,
+            steps=int(gen_kwargs.get("steps")),
+            gen_length=int(gen_kwargs.get("gen_length")),
+            block_length=int(gen_kwargs.get("block_length")),
+            cfg_scale=float(gen_kwargs.get("cfg_scale", 0.0) or 0.0),
+            remasking=gen_kwargs.get("remasking") or "low_confidence",
             mask_id=self.mask_id,
         )
 
@@ -1098,6 +1151,8 @@ class LLaDA(TemplateLM):
             )
             if self.student_prompt_pool_active:
                 out = self._generate_with_student_prompt_pool_active(context_enc, gen_kwargs)
+            elif self.student_prompt_layer_split:
+                out = self._generate_with_student_layer_split(context_enc, gen_kwargs)
             elif self.student_prompt_dynamic_kv:
                 out = self._generate_with_student_dynamic_kv(context_enc, gen_kwargs)
             elif self.student_prompt_prune:
