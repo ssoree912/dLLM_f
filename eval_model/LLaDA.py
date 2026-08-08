@@ -107,6 +107,7 @@ class LLaDA(TemplateLM):
         student_prompt_layer_split: bool = False,
         student_frozen_layers: int = 16,
         student_refresh_tokens: int = 0,
+        student_refresh_path: Optional[str] = None,
         student_selection_mode: str = "global",
         student_refresh_interval: int = 1,
         student_budget: int = 128,
@@ -140,6 +141,11 @@ class LLaDA(TemplateLM):
         self.student_refresh_tokens = int(student_refresh_tokens)
         if self.student_refresh_tokens < 0:
             raise RuntimeError("student_refresh_tokens must be non-negative")
+        # Keeping and refreshing are different questions, so they can be ranked by
+        # different students: importance decides what survives, drift decides what
+        # stays fresh.
+        self.student_refresh_path = student_refresh_path
+        self.refresh_student = None
         self.student_selection_mode = str(student_selection_mode).strip().lower()
         if self.student_selection_mode not in {"layer_union", "global"}:
             raise RuntimeError("student_selection_mode must be one of: layer_union, global")
@@ -394,6 +400,10 @@ class LLaDA(TemplateLM):
             if self.student_path is None:
                 raise RuntimeError("student prompt compression requires student_path")
             self.student = self._load_prompt_utility_student(self.student_path)
+            if self.student_refresh_path is not None:
+                self.refresh_student = self._load_prompt_utility_student(
+                    self.student_refresh_path
+                )
 
         if self.rank == 0:
                 print(f"Feature Cache is {is_feature_cache}.CFG Cache is {is_cfg_cache},prompt_interval_steps={prompt_interval_steps}, gen_interval_steps={gen_interval_steps}, cfg_interval_steps={cfg_interval_steps},transfer_ratio={transfer_ratio}")
@@ -452,8 +462,9 @@ class LLaDA(TemplateLM):
         return student
 
     @torch.inference_mode()
-    def _predict_student_scores(self, input_ids: torch.Tensor) -> torch.Tensor:
-        if self.student is None:
+    def _predict_student_scores(self, input_ids: torch.Tensor, student=None) -> torch.Tensor:
+        student = self.student if student is None else student
+        if student is None:
             raise RuntimeError("student model is not loaded")
         if input_ids.shape[0] != 1:
             raise RuntimeError("student prompt compression currently requires batch_size=1")
@@ -474,8 +485,8 @@ class LLaDA(TemplateLM):
             device=input_ids.device,
         )
         scores = []
-        for layer_id in self.student.layer_indices:
-            layer_scores = self.student.forward_layer(
+        for layer_id in student.layer_indices:
+            layer_scores = student.forward_layer(
                 layer_id,
                 out.hidden_states[layer_id].float(),
                 prompt_indices,
@@ -541,6 +552,11 @@ class LLaDA(TemplateLM):
             teacher_scores=student_scores,
             frozen_layers=self.student_frozen_layers,
             refresh_tokens=self.student_refresh_tokens,
+            refresh_scores=(
+                None
+                if self.refresh_student is None
+                else self._predict_student_scores(input_ids, self.refresh_student)
+            ),
         )
         return generate_with_layer_split_prompt_kv(
             input_ids=input_ids,

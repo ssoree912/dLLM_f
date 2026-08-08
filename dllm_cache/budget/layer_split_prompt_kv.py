@@ -109,12 +109,18 @@ def build_layer_split_prompt_cache(
     teacher_scores: torch.Tensor,
     frozen_layers: int,
     refresh_tokens: int = 0,
+    refresh_scores: torch.Tensor | None = None,
 ) -> LayerSplitPromptCache:
     """Prefill the whole prompt once, then keep only what the split needs.
 
     `refresh_tokens` narrows the deep layers further: only that many of the kept
     positions are re-forwarded there, and the rest serve their prefill K/V. Zero
     means every kept position is refreshed.
+
+    The two decisions want different signals. Which positions to keep is a question
+    about importance; which of them to keep refreshing is a question about drift,
+    and on SAMSum the two rank positions almost independently (Spearman 0.096).
+    Pass `refresh_scores` to rank the refresh set separately from the keep set.
     """
     blocks = find_transformer_blocks(model)
     prompt_length = int(prompt_ids.shape[1])
@@ -131,9 +137,14 @@ def build_layer_split_prompt_cache(
         refresh = keep
         stale = torch.empty(0, dtype=torch.long)
     else:
-        # Attention mass concentrates hard, so the top slice carries most of the
-        # error a frozen entry would introduce.
-        ranked = torch.topk(pooled[keep], k=refresh_tokens, largest=True).indices
+        if refresh_scores is None:
+            refresh_rank = pooled
+        else:
+            refresh_rank = refresh_scores.detach().float().cpu()
+            if refresh_rank.shape != (len(blocks), prompt_length):
+                raise RuntimeError("refresh scores must have shape [layer, prompt]")
+            refresh_rank = refresh_rank.mean(dim=0)
+        ranked = torch.topk(refresh_rank[keep], k=refresh_tokens, largest=True).indices
         refresh_mask = torch.zeros(keep_count, dtype=torch.bool)
         refresh_mask[ranked] = True
         refresh = keep[refresh_mask]
