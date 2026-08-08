@@ -38,6 +38,47 @@ from dllm_cache.budget.prompt_kv_cache import LayerPromptKV, repeat_heads
 from utils.generate_function import add_gumbel_noise, get_num_transfer_tokens
 
 
+def build_rotation_schedule(
+    weights: torch.Tensor,
+    refresh_tokens: int,
+    steps: int,
+) -> list[torch.Tensor]:
+    """Spread refreshes over time so no position stays stale for long.
+
+    A fixed refresh set leaves the rest frozen for the whole trajectory, which is
+    the same failure mode as never refreshing at all -- just applied to fewer
+    positions. Rotating instead bounds every position's staleness while spending
+    the identical budget.
+
+    Weights bias the rotation: a position whose value vector drifts fast comes
+    round more often than one that barely moves. Uniform weights degenerate to
+    plain round-robin, where each position is refreshed every
+    `len(weights) / refresh_tokens` steps.
+
+    Deficit round-robin keeps the per-step count exactly `refresh_tokens`.
+    """
+    count = int(weights.numel())
+    if not 0 < refresh_tokens <= count:
+        raise RuntimeError("refresh_tokens must fall inside the kept prompt")
+    positive = weights.clamp_min(0.0).double()
+    if float(positive.sum()) <= 0.0:
+        positive = torch.ones(count, dtype=torch.float64)
+    # Per-step share of a refresh slot, summing to refresh_tokens.
+    rate = positive / positive.sum() * float(refresh_tokens)
+    rate = rate.clamp(max=1.0)
+    if float(rate.sum()) > 0.0:
+        rate = rate / rate.sum() * float(refresh_tokens)
+        rate = rate.clamp(max=1.0)
+    credit = torch.zeros(count, dtype=torch.float64)
+    schedule: list[torch.Tensor] = []
+    for _ in range(steps):
+        credit += rate
+        chosen = torch.topk(credit, k=refresh_tokens, largest=True).indices
+        credit[chosen] -= 1.0
+        schedule.append(chosen.sort().values.to(torch.long))
+    return schedule
+
+
 @dataclass(slots=True)
 class LayerSplitPromptCache:
     prompt_length: int
@@ -49,6 +90,24 @@ class LayerSplitPromptCache:
     frozen_kv: dict[int, LayerPromptKV] = field(default_factory=dict)
     stale_kv: dict[int, LayerPromptKV] = field(default_factory=dict)
     split_hidden: torch.Tensor | None = None
+    # Rotation mode: every kept position holds a slot in a mutable deep-layer cache
+    # that refreshed positions write back into.
+    schedule: list[torch.Tensor] = field(default_factory=list)
+    deep_kv: dict[int, LayerPromptKV] = field(default_factory=dict)
+    split_hidden_all: torch.Tensor | None = None
+    # Measured mode: per deep layer, the prompt's block input and its last attention
+    # output, so movement can be observed rather than predicted.
+    hidden: dict[int, torch.Tensor] = field(default_factory=dict)
+    attn: dict[int, torch.Tensor] = field(default_factory=dict)
+    measured_tokens: int = 0
+
+    @property
+    def measures(self) -> bool:
+        return self.measured_tokens > 0
+
+    @property
+    def rotates(self) -> bool:
+        return bool(self.schedule)
 
     @property
     def reduced_prompt_length(self) -> int:
@@ -110,6 +169,8 @@ def build_layer_split_prompt_cache(
     frozen_layers: int,
     refresh_tokens: int = 0,
     refresh_scores: torch.Tensor | None = None,
+    rotate_steps: int = 0,
+    measured_tokens: int = 0,
 ) -> LayerSplitPromptCache:
     """Prefill the whole prompt once, then keep only what the split needs.
 
@@ -133,7 +194,15 @@ def build_layer_split_prompt_cache(
     # One shared token set, so the surviving prompt stays a contiguous sequence.
     pooled = scores.mean(dim=0)
     keep = torch.topk(pooled, k=keep_count, largest=True).indices.sort().values
-    if refresh_tokens <= 0 or refresh_tokens >= keep_count:
+    measuring = 0 < measured_tokens < keep_count
+    rotating = (
+        not measuring and rotate_steps > 0 and 0 < refresh_tokens < keep_count
+    )
+    if measuring or refresh_tokens <= 0 or refresh_tokens >= keep_count:
+        refresh = keep
+        stale = torch.empty(0, dtype=torch.long)
+    elif rotating:
+        # Every kept position stays in play; the schedule decides when each is due.
         refresh = keep
         stale = torch.empty(0, dtype=torch.long)
     else:
@@ -157,6 +226,19 @@ def build_layer_split_prompt_cache(
         refresh_indices=refresh,
         stale_indices=stale,
     )
+    if measuring:
+        cache.measured_tokens = measured_tokens
+    if rotating:
+        if refresh_scores is None:
+            rotation_weight = torch.ones(keep_count)
+        else:
+            weights = refresh_scores.detach().float().cpu()
+            if weights.shape != (len(blocks), prompt_length):
+                raise RuntimeError("refresh scores must have shape [layer, prompt]")
+            rotation_weight = weights.mean(dim=0)[keep]
+        cache.schedule = build_rotation_schedule(
+            rotation_weight, refresh_tokens, rotate_steps
+        )
 
     decoder = getattr(model, "model")
     config = getattr(decoder, "config")
@@ -174,15 +256,28 @@ def build_layer_split_prompt_cache(
     for layer_id, block in enumerate(blocks):
         if layer_id == frozen_layers:
             cache.split_hidden = x.index_select(dim=1, index=refresh_device).detach()
+            if rotating:
+                cache.split_hidden_all = x.index_select(
+                    dim=1, index=keep_device
+                ).detach()
         q, k, v = project_qkv(block, x)
         q_heads, k_heads, v_heads = project_heads_at_positions(block, q, k, v, positions)
         if q_heads.shape[1] != k_heads.shape[1]:
             k_heads = repeat_heads(k_heads, q_heads.shape[1])
             v_heads = repeat_heads(v_heads, q_heads.shape[1])
+        if measuring and layer_id >= frozen_layers:
+            cache.hidden[layer_id] = x.index_select(
+                dim=1, index=keep_device
+            ).detach().clone()
         if layer_id < frozen_layers:
             cache.frozen_kv[layer_id] = LayerPromptKV(
                 key=k_heads.index_select(dim=2, index=keep_device).detach(),
                 value=v_heads.index_select(dim=2, index=keep_device).detach(),
+            )
+        elif rotating:
+            cache.deep_kv[layer_id] = LayerPromptKV(
+                key=k_heads.index_select(dim=2, index=keep_device).detach().clone(),
+                value=v_heads.index_select(dim=2, index=keep_device).detach().clone(),
             )
         elif stale_device.numel():
             cache.stale_kv[layer_id] = LayerPromptKV(
@@ -193,11 +288,17 @@ def build_layer_split_prompt_cache(
             q_heads, k_heads, v_heads, dropout_p=0.0, is_causal=False
         )
         att = att.transpose(1, 2).contiguous().view(x.shape[0], x.shape[1], x.shape[2])
+        if measuring and layer_id >= frozen_layers:
+            cache.attn[layer_id] = att.index_select(
+                dim=1, index=keep_device
+            ).detach().clone()
         x = x + block.dropout(block.attn_out(att))
         x = run_block_mlp(block, x)
 
     if frozen_layers == len(blocks):
         cache.split_hidden = x.index_select(dim=1, index=refresh_device).detach()
+        if rotating:
+            cache.split_hidden_all = x.index_select(dim=1, index=keep_device).detach()
     if cache.split_hidden is None:
         raise RuntimeError("layer-split cache never captured the split hidden state")
     return cache
@@ -262,6 +363,183 @@ def _run_frozen_block(
     return run_block_mlp(block, x)
 
 
+def rotating_suffix_logits(
+    model: nn.Module,
+    suffix_ids: torch.Tensor,
+    cache: LayerSplitPromptCache,
+    step: int,
+) -> torch.Tensor:
+    """Refresh this step's slice of the prompt and write it back into the cache."""
+    decoder = getattr(model, "model")
+    config = getattr(decoder, "config")
+    due = cache.schedule[step % len(cache.schedule)].to(suffix_ids.device)
+    keep = cache.keep_indices.to(suffix_ids.device)
+
+    x = decoder.transformer.wte(suffix_ids)
+    if bool(config.input_emb_norm):
+        x = x * (float(config.d_model) ** 0.5)
+    x = decoder.transformer.emb_drop(x)
+    suffix_length = int(suffix_ids.shape[1])
+    suffix_positions = torch.arange(
+        cache.prompt_length,
+        cache.prompt_length + suffix_length,
+        device=x.device,
+        dtype=torch.long,
+    )
+    due_positions = torch.cat([keep.index_select(0, due), suffix_positions])
+    due_count = int(due.numel())
+
+    for layer_id, block in enumerate(decoder.transformer.blocks):
+        if layer_id == cache.frozen_layers:
+            split = cache.split_hidden_all
+            if split is None:
+                raise RuntimeError("rotation needs the full split hidden state")
+            head = split.index_select(1, due).to(device=x.device, dtype=x.dtype)
+            x = torch.cat([head, x], dim=1)
+        if layer_id < cache.frozen_layers:
+            x = _run_frozen_block(block, x, suffix_positions, cache)
+        else:
+            x = _run_rotating_block(block, x, due_positions, due, cache)
+    return suffix_logits_from_hidden(decoder, x[:, due_count:, :])
+
+
+def _run_rotating_block(
+    block: nn.Module,
+    x: torch.Tensor,
+    due_positions: torch.Tensor,
+    due: torch.Tensor,
+    cache: LayerSplitPromptCache,
+) -> torch.Tensor:
+    layer_id = int(block.layer_id)
+    cached = cache.deep_kv.get(layer_id)
+    if cached is None:
+        raise RuntimeError(f"rotation cache missing deep layer {layer_id}")
+    q, k, v = project_qkv(block, x)
+    q_heads, k_heads, v_heads = project_heads_at_positions(block, q, k, v, due_positions)
+    if q_heads.shape[1] != k_heads.shape[1]:
+        k_heads = repeat_heads(k_heads, q_heads.shape[1])
+        v_heads = repeat_heads(v_heads, q_heads.shape[1])
+    due_count = int(due.numel())
+    # Write this step's recomputed prompt entries back, so a position stays fresh
+    # until its next turn rather than reverting to the prefill value.
+    slots = due.view(1, 1, -1, 1).expand(
+        cached.key.shape[0], cached.key.shape[1], -1, cached.key.shape[3]
+    )
+    cached.key.scatter_(2, slots, k_heads[:, :, :due_count, :].to(cached.key.dtype))
+    cached.value.scatter_(2, slots, v_heads[:, :, :due_count, :].to(cached.value.dtype))
+    key = torch.cat(
+        [cached.key.to(k_heads.dtype), k_heads[:, :, due_count:, :]], dim=2
+    )
+    value = torch.cat(
+        [cached.value.to(v_heads.dtype), v_heads[:, :, due_count:, :]], dim=2
+    )
+    att = F.scaled_dot_product_attention(
+        q_heads, key, value, dropout_p=0.0, is_causal=False
+    )
+    att = att.transpose(1, 2).contiguous().view(x.shape[0], x.shape[1], x.shape[2])
+    x = x + block.dropout(block.attn_out(att))
+    return run_block_mlp(block, x)
+
+
+def measured_suffix_logits(
+    model: nn.Module,
+    suffix_ids: torch.Tensor,
+    cache: LayerSplitPromptCache,
+) -> torch.Tensor:
+    """Pick the refresh set from measured change instead of a predicted schedule.
+
+    dLLM-Cache ranks generation positions by how far their value vector moved from
+    the cached one. That test does not carry over to the prompt: prompt token ids
+    never change, so a position whose hidden state is served from cache reprojects
+    to exactly its cached value and would report zero movement forever.
+
+    What does move a prompt position is its attention to the suffix, so that is
+    what we compare. Query, key and value are reprojected for every kept position
+    each step -- which also keeps the keys the suffix reads as fresh as the cached
+    hidden states allow -- and only the positions whose attention output moved most
+    pay for `attn_out` and the MLP.
+    """
+    decoder = getattr(model, "model")
+    config = getattr(decoder, "config")
+    x = decoder.transformer.wte(suffix_ids)
+    if bool(config.input_emb_norm):
+        x = x * (float(config.d_model) ** 0.5)
+    x = decoder.transformer.emb_drop(x)
+    suffix_length = int(suffix_ids.shape[1])
+    suffix_positions = torch.arange(
+        cache.prompt_length,
+        cache.prompt_length + suffix_length,
+        device=x.device,
+        dtype=torch.long,
+    )
+    prompt_positions = cache.keep_indices.to(x.device)
+
+    for layer_id, block in enumerate(decoder.transformer.blocks):
+        if layer_id < cache.frozen_layers:
+            x = _run_frozen_block(block, x, suffix_positions, cache)
+        else:
+            x = _run_measured_block(
+                block, x, prompt_positions, suffix_positions, cache
+            )
+    return suffix_logits_from_hidden(decoder, x)
+
+
+def _run_measured_block(
+    block: nn.Module,
+    x_suffix: torch.Tensor,
+    prompt_positions: torch.Tensor,
+    suffix_positions: torch.Tensor,
+    cache: LayerSplitPromptCache,
+) -> torch.Tensor:
+    layer_id = int(block.layer_id)
+    hidden = cache.hidden[layer_id]
+    prompt_hidden = hidden.to(device=x_suffix.device, dtype=x_suffix.dtype)
+
+    q_p, k_p, v_p = project_qkv(block, prompt_hidden)
+    q_ph, k_ph, v_ph = project_heads_at_positions(block, q_p, k_p, v_p, prompt_positions)
+    q_s, k_s, v_s = project_qkv(block, x_suffix)
+    q_sh, k_sh, v_sh = project_heads_at_positions(block, q_s, k_s, v_s, suffix_positions)
+    if q_ph.shape[1] != k_ph.shape[1]:
+        k_ph = repeat_heads(k_ph, q_ph.shape[1])
+        v_ph = repeat_heads(v_ph, q_ph.shape[1])
+        k_sh = repeat_heads(k_sh, q_sh.shape[1])
+        v_sh = repeat_heads(v_sh, q_sh.shape[1])
+
+    key = torch.cat([k_ph, k_sh], dim=2)
+    value = torch.cat([v_ph, v_sh], dim=2)
+    att_p = F.scaled_dot_product_attention(q_ph, key, value, dropout_p=0.0, is_causal=False)
+    att_s = F.scaled_dot_product_attention(q_sh, key, value, dropout_p=0.0, is_causal=False)
+    att_p = att_p.transpose(1, 2).contiguous().view_as(prompt_hidden)
+    att_s = att_s.transpose(1, 2).contiguous().view_as(x_suffix)
+
+    # Movement since this position was last refreshed, not since the last step.
+    # What the cache gets wrong is the hidden state it is still serving, and that
+    # error is whatever has accumulated since it was last written. Drift saturates
+    # -- 2-3% per step but only 0.13-0.37 in total -- so a per-step delta looks
+    # nearly uniform across positions and would never surface a long-stale one.
+    previous = cache.attn[layer_id].to(device=att_p.device, dtype=att_p.dtype)
+    moved = 1.0 - F.cosine_similarity(att_p.float(), previous.float(), dim=-1)
+    due = torch.topk(moved.squeeze(0), k=cache.measured_tokens, largest=True).indices
+
+    slots = due.view(1, -1, 1).expand(1, -1, prompt_hidden.shape[-1])
+    cache.attn[layer_id].scatter_(
+        1, slots, torch.gather(att_p, 1, slots).detach().to(cache.attn[layer_id].dtype)
+    )
+    selected_hidden = torch.gather(prompt_hidden, 1, slots)
+    selected_att = torch.gather(att_p, 1, slots)
+    updated = selected_hidden + block.dropout(block.attn_out(selected_att))
+    updated = run_block_mlp(block, updated)
+
+    following = cache.hidden.get(layer_id + 1)
+    if following is None:
+        cache.hidden[layer_id + 1] = prompt_hidden.detach().clone()
+        following = cache.hidden[layer_id + 1]
+    following.scatter_(1, slots, updated.detach().to(following.dtype))
+
+    x_suffix = x_suffix + block.dropout(block.attn_out(att_s))
+    return run_block_mlp(block, x_suffix)
+
+
 def _run_refreshed_block(
     block: nn.Module,
     x: torch.Tensor,
@@ -324,6 +602,7 @@ def generate_with_layer_split_prompt_kv(
     )
     x[:, :prompt_length] = input_ids
 
+    global_step = 0
     for num_block in range(num_blocks):
         start_idx = prompt_length + num_block * block_length
         end_idx = prompt_length + (num_block + 1) * block_length
@@ -331,9 +610,15 @@ def generate_with_layer_split_prompt_kv(
         num_transfer_tokens = get_num_transfer_tokens(block_mask_index, steps_per_block)
         for step_idx in range(steps_per_block):
             mask_index = x == mask_id
-            logits = layer_split_suffix_logits(
-                model, x[:, prompt_length:], prompt_cache
-            )
+            suffix_ids = x[:, prompt_length:]
+            if prompt_cache.measures:
+                logits = measured_suffix_logits(model, suffix_ids, prompt_cache)
+            elif prompt_cache.rotates:
+                logits = rotating_suffix_logits(
+                    model, suffix_ids, prompt_cache, global_step
+                )
+            else:
+                logits = layer_split_suffix_logits(model, suffix_ids, prompt_cache)
             logits_with_noise = add_gumbel_noise(logits, temperature=temperature)
             x0 = torch.argmax(logits_with_noise, dim=-1)
             if remasking == "low_confidence":
@@ -354,6 +639,7 @@ def generate_with_layer_split_prompt_kv(
                 select_index = torch.topk(confidence[batch_idx], k=count).indices
                 transfer_index[batch_idx, select_index] = True
             x[:, prompt_length:][transfer_index] = x0[transfer_index]
+            global_step += 1
     return x[:, prompt_length:]
 
 
@@ -361,5 +647,8 @@ __all__ = [
     "LayerSplitPromptCache",
     "build_layer_split_prompt_cache",
     "generate_with_layer_split_prompt_kv",
+    "build_rotation_schedule",
     "layer_split_suffix_logits",
+    "measured_suffix_logits",
+    "rotating_suffix_logits",
 ]

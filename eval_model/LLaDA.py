@@ -108,6 +108,8 @@ class LLaDA(TemplateLM):
         student_frozen_layers: int = 16,
         student_refresh_tokens: int = 0,
         student_refresh_path: Optional[str] = None,
+        student_refresh_rotate: bool = False,
+        student_measured_tokens: int = 0,
         student_selection_mode: str = "global",
         student_refresh_interval: int = 1,
         student_budget: int = 128,
@@ -146,6 +148,12 @@ class LLaDA(TemplateLM):
         # stays fresh.
         self.student_refresh_path = student_refresh_path
         self.refresh_student = None
+        # Rotate the refresh set instead of freezing the complement forever.
+        self.student_refresh_rotate = self._coerce_bool(student_refresh_rotate)
+        # Measure movement at runtime instead of scheduling it ahead of time.
+        self.student_measured_tokens = int(student_measured_tokens)
+        if self.student_measured_tokens < 0:
+            raise RuntimeError("student_measured_tokens must be non-negative")
         self.student_selection_mode = str(student_selection_mode).strip().lower()
         if self.student_selection_mode not in {"layer_union", "global"}:
             raise RuntimeError("student_selection_mode must be one of: layer_union, global")
@@ -557,6 +565,10 @@ class LLaDA(TemplateLM):
                 if self.refresh_student is None
                 else self._predict_student_scores(input_ids, self.refresh_student)
             ),
+            rotate_steps=(
+                int(gen_kwargs.get("steps")) if self.student_refresh_rotate else 0
+            ),
+            measured_tokens=self.student_measured_tokens,
         )
         return generate_with_layer_split_prompt_kv(
             input_ids=input_ids,
