@@ -105,6 +105,12 @@ class LLaDA(TemplateLM):
         student_prompt_pool_active: bool = False,
         student_prompt_dynamic_kv: bool = False,
         student_prompt_layer_split: bool = False,
+        student_prompt_layer_head: bool = False,
+        student_layer_head_profile: Optional[str] = None,
+        student_budget_per_head: int = 128,
+        student_boundary_layers: str = "0:1:-2:-1",
+        student_layer_beta: float = 0.4,
+        student_head_alpha: float = 0.1,
         student_prompt_drift_refresh: bool = False,
         student_drift_mode: str = "oracle",
         student_drift_ckpt: Optional[str] = None,
@@ -143,6 +149,22 @@ class LLaDA(TemplateLM):
         self.student_prompt_pool_active = self._coerce_bool(student_prompt_pool_active)
         self.student_prompt_dynamic_kv = self._coerce_bool(student_prompt_dynamic_kv)
         self.student_prompt_layer_split = self._coerce_bool(student_prompt_layer_split)
+        # Layer axis: I(l) = 1 - cos(h_in, h_out) splits a per-layer budget between
+        # boundary layers (large hidden-state shift) and middle layers (near-redundant).
+        # Head axis: P_h(l) = mask->prompt / (mask->prompt + mask->mask) splits each
+        # layer's budget across heads by how much that head actually looks at the
+        # prompt. Both profiles are calibrated offline (head_pref_profile.py /
+        # compute_layer_head_profile.py); token *ranking* within a bucket still comes
+        # from the same student score the single-budget path uses.
+        self.student_prompt_layer_head = self._coerce_bool(student_prompt_layer_head)
+        self.student_layer_head_profile = student_layer_head_profile
+        self.layer_head_profile = None
+        self.student_budget_per_head = int(student_budget_per_head)
+        if self.student_budget_per_head < 0:
+            raise RuntimeError("student_budget_per_head must be non-negative")
+        self.student_boundary_layers_raw = str(student_boundary_layers)
+        self.student_layer_beta = float(student_layer_beta)
+        self.student_head_alpha = float(student_head_alpha)
         self.student_prompt_drift_refresh = self._coerce_bool(student_prompt_drift_refresh)
         self.student_drift_mode = str(student_drift_mode)
         if self.student_drift_mode not in {"oracle", "student"}:
@@ -206,6 +228,7 @@ class LLaDA(TemplateLM):
                 self.student_prompt_pool_active,
                 self.student_prompt_dynamic_kv,
                 self.student_prompt_layer_split,
+                self.student_prompt_layer_head,
                 self.student_prompt_drift_refresh,
             )
         )
@@ -429,6 +452,7 @@ class LLaDA(TemplateLM):
             or self.student_prompt_pool_active
             or self.student_prompt_dynamic_kv
             or self.student_prompt_layer_split
+            or self.student_prompt_layer_head
             or self.student_prompt_drift_refresh
         ):
             if self.student_path is None:
@@ -437,6 +461,23 @@ class LLaDA(TemplateLM):
             if self.student_refresh_path is not None:
                 self.refresh_student = self._load_prompt_utility_student(
                     self.student_refresh_path
+                )
+        if self.student_prompt_layer_head:
+            if self.student_layer_head_profile is None:
+                raise RuntimeError(
+                    "student_prompt_layer_head requires student_layer_head_profile "
+                    "(a JSON file from compute_layer_head_profile.py)"
+                )
+            import json as _json
+
+            with open(self.student_layer_head_profile, "r", encoding="utf-8") as handle:
+                self.layer_head_profile = _json.load(handle)
+            if self.rank == 0:
+                meta = self.layer_head_profile.get("meta", {})
+                print(
+                    f"Layer+head prompt-KV profile loaded from {self.student_layer_head_profile} "
+                    f"(samples={meta.get('sample_count')}, layers={len(self.layer_head_profile['layer_importance'])})",
+                    flush=True,
                 )
         if self.student_prompt_drift_refresh and self.student_drift_mode == "student":
             if self.student_drift_ckpt is None:
@@ -571,6 +612,62 @@ class LLaDA(TemplateLM):
             teacher_scores=student_scores,
         )
         return generate_with_prompt_kv(
+            input_ids=input_ids,
+            model=self.model,
+            prompt_cache=prompt_cache,
+            steps=int(gen_kwargs.get("steps")),
+            gen_length=int(gen_kwargs.get("gen_length")),
+            block_length=int(gen_kwargs.get("block_length")),
+            cfg_scale=float(gen_kwargs.get("cfg_scale", 0.0) or 0.0),
+            remasking=gen_kwargs.get("remasking", None)
+            if gen_kwargs.get("remasking", None)
+            else "low_confidence",
+            mask_id=self.mask_id,
+        )
+
+    def _resolve_boundary_layers(self, layer_count: int) -> list[int]:
+        # ":" not "," -- model_args itself is a comma-separated key=value list, so a
+        # comma-separated value here would split into unparseable extra fields.
+        boundary = set()
+        for raw in self.student_boundary_layers_raw.split(":"):
+            raw = raw.strip()
+            if not raw:
+                continue
+            index = int(raw)
+            if index < 0:
+                index += layer_count
+            if not (0 <= index < layer_count):
+                raise RuntimeError(
+                    f"student_boundary_layers index {raw} out of range for {layer_count} layers"
+                )
+            boundary.add(index)
+        return sorted(boundary)
+
+    @torch.inference_mode()
+    def _generate_with_student_layer_head(self, input_ids: torch.Tensor, gen_kwargs: dict) -> torch.Tensor:
+        """Two-stage prompt-KV budget: layer axis by I(l), head axis by P_h(l).
+
+        Both profiles come from an offline calibration pass (head_pref_profile.py);
+        within a (layer, head) bucket, tokens are still ranked by the same student
+        score `_generate_with_student_prompt_kv` uses -- this only changes how many
+        tokens each head gets to keep, not which ones look important.
+        """
+        from dllm_cache.budget.layer_head_prompt_forward import generate_with_layer_head_prompt_kv
+        from dllm_cache.budget.layer_head_prompt_kv import build_layer_head_prompt_cache
+
+        student_scores = self._predict_student_scores(input_ids)
+        boundary_layers = self._resolve_boundary_layers(student_scores.shape[0])
+        prompt_cache = build_layer_head_prompt_cache(
+            self.model,
+            input_ids,
+            teacher_scores=student_scores,
+            profile=self.layer_head_profile,
+            budget_per_head=self.student_budget_per_head,
+            boundary_layers=boundary_layers,
+            beta=self.student_layer_beta,
+            alpha=self.student_head_alpha,
+        )
+        return generate_with_layer_head_prompt_kv(
             input_ids=input_ids,
             model=self.model,
             prompt_cache=prompt_cache,
@@ -1260,6 +1357,8 @@ class LLaDA(TemplateLM):
                 out = self._generate_with_drift_refresh(context_enc, gen_kwargs)
             elif self.student_prompt_layer_split:
                 out = self._generate_with_student_layer_split(context_enc, gen_kwargs)
+            elif self.student_prompt_layer_head:
+                out = self._generate_with_student_layer_head(context_enc, gen_kwargs)
             elif self.student_prompt_dynamic_kv:
                 out = self._generate_with_student_dynamic_kv(context_enc, gen_kwargs)
             elif self.student_prompt_prune:
