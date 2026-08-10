@@ -105,11 +105,17 @@ class LLaDA(TemplateLM):
         student_prompt_pool_active: bool = False,
         student_prompt_dynamic_kv: bool = False,
         student_prompt_layer_split: bool = False,
+        student_prompt_drift_refresh: bool = False,
+        student_drift_mode: str = "oracle",
+        student_drift_ckpt: Optional[str] = None,
+        student_drift_frozen_layers: int = 0,
         student_frozen_layers: int = 16,
         student_refresh_tokens: int = 0,
         student_refresh_path: Optional[str] = None,
         student_refresh_rotate: bool = False,
         student_measured_tokens: int = 0,
+        student_full_refresh_interval: int = 0,
+        student_random_scores: bool = False,
         student_selection_mode: str = "global",
         student_refresh_interval: int = 1,
         student_budget: int = 128,
@@ -137,6 +143,16 @@ class LLaDA(TemplateLM):
         self.student_prompt_pool_active = self._coerce_bool(student_prompt_pool_active)
         self.student_prompt_dynamic_kv = self._coerce_bool(student_prompt_dynamic_kv)
         self.student_prompt_layer_split = self._coerce_bool(student_prompt_layer_split)
+        self.student_prompt_drift_refresh = self._coerce_bool(student_prompt_drift_refresh)
+        self.student_drift_mode = str(student_drift_mode)
+        if self.student_drift_mode not in {"oracle", "student"}:
+            raise RuntimeError("student_drift_mode must be 'oracle' or 'student'")
+        self.student_drift_ckpt = student_drift_ckpt
+        # Drift says the shallow layers barely move, so refreshing them is wasted work.
+        self.student_drift_frozen_layers = int(student_drift_frozen_layers)
+        if self.student_drift_frozen_layers < 0:
+            raise RuntimeError("student_drift_frozen_layers must be non-negative")
+        self.drift_refresh_student = None
         self.student_frozen_layers = int(student_frozen_layers)
         if self.student_frozen_layers < 0:
             raise RuntimeError("student_frozen_layers must be non-negative")
@@ -154,6 +170,14 @@ class LLaDA(TemplateLM):
         self.student_measured_tokens = int(student_measured_tokens)
         if self.student_measured_tokens < 0:
             raise RuntimeError("student_measured_tokens must be non-negative")
+        # Periodic full recompute on top of the per-step top-K, the way dLLM-Cache
+        # pairs partial updates with a full refresh every `refresh_interval` steps.
+        self.student_full_refresh_interval = int(student_full_refresh_interval)
+        if self.student_full_refresh_interval < 0:
+            raise RuntimeError("student_full_refresh_interval must be non-negative")
+        # Control: keep the same budget but choose the kept positions at random, to
+        # separate "this selector is wrong" from "dropping tokens is wrong".
+        self.student_random_scores = self._coerce_bool(student_random_scores)
         self.student_selection_mode = str(student_selection_mode).strip().lower()
         if self.student_selection_mode not in {"layer_union", "global"}:
             raise RuntimeError("student_selection_mode must be one of: layer_union, global")
@@ -182,6 +206,7 @@ class LLaDA(TemplateLM):
                 self.student_prompt_pool_active,
                 self.student_prompt_dynamic_kv,
                 self.student_prompt_layer_split,
+                self.student_prompt_drift_refresh,
             )
         )
         if active_student_modes > 1:
@@ -404,6 +429,7 @@ class LLaDA(TemplateLM):
             or self.student_prompt_pool_active
             or self.student_prompt_dynamic_kv
             or self.student_prompt_layer_split
+            or self.student_prompt_drift_refresh
         ):
             if self.student_path is None:
                 raise RuntimeError("student prompt compression requires student_path")
@@ -412,6 +438,14 @@ class LLaDA(TemplateLM):
                 self.refresh_student = self._load_prompt_utility_student(
                     self.student_refresh_path
                 )
+        if self.student_prompt_drift_refresh and self.student_drift_mode == "student":
+            if self.student_drift_ckpt is None:
+                raise RuntimeError("student_drift_mode=student requires student_drift_ckpt")
+            from dllm_cache.budget.drift_refresh_kv import load_refresh_student
+
+            self.drift_refresh_student = load_refresh_student(
+                self.student_drift_ckpt, self.device
+            )
 
         if self.rank == 0:
                 print(f"Feature Cache is {is_feature_cache}.CFG Cache is {is_cfg_cache},prompt_interval_steps={prompt_interval_steps}, gen_interval_steps={gen_interval_steps}, cfg_interval_steps={cfg_interval_steps},transfer_ratio={transfer_ratio}")
@@ -446,6 +480,12 @@ class LLaDA(TemplateLM):
             elif self.student_prompt_prune:
                 mode = "prune"
                 budget_text = f"budget={self.student_budget}"
+            elif self.student_prompt_drift_refresh:
+                mode = f"drift refresh ({self.student_drift_mode})"
+                budget_text = (
+                    f"budget={self.student_budget}, "
+                    f"refresh_tokens={self.student_refresh_tokens or self.student_budget // 4}"
+                )
             elif self.student_prompt_layer_split:
                 mode = "layer-split prompt cache"
                 budget_text = (
@@ -474,6 +514,11 @@ class LLaDA(TemplateLM):
         student = self.student if student is None else student
         if student is None:
             raise RuntimeError("student model is not loaded")
+        if self.student_random_scores:
+            layers = len(self.model.model.transformer.blocks)
+            return torch.rand(
+                (layers, int(input_ids.shape[1])), device=input_ids.device
+            )
         if input_ids.shape[0] != 1:
             raise RuntimeError("student prompt compression currently requires batch_size=1")
         out = self.model(
@@ -569,6 +614,7 @@ class LLaDA(TemplateLM):
                 int(gen_kwargs.get("steps")) if self.student_refresh_rotate else 0
             ),
             measured_tokens=self.student_measured_tokens,
+            full_refresh_interval=self.student_full_refresh_interval,
         )
         return generate_with_layer_split_prompt_kv(
             input_ids=input_ids,
@@ -611,6 +657,37 @@ class LLaDA(TemplateLM):
             gen_length=int(gen_kwargs.get("gen_length")),
             block_length=int(gen_kwargs.get("block_length")),
             refresh_interval=self.student_refresh_interval,
+            cfg_scale=float(gen_kwargs.get("cfg_scale", 0.0) or 0.0),
+            remasking=gen_kwargs.get("remasking") or "low_confidence",
+            mask_id=self.mask_id,
+        )
+
+    @torch.inference_mode()
+    def _generate_with_drift_refresh(self, input_ids: torch.Tensor, gen_kwargs: dict) -> torch.Tensor:
+        """Keep set from the importance student; refresh set chosen per step by drift.
+
+        `student_drift_mode=oracle` ranks by the measured r* = attention x value staleness
+        (an upper bound, it needs the fresh values); `student` uses the trained refresh
+        student, which sees only inference-time features.
+        """
+        from dllm_cache.budget.drift_refresh_kv import generate_with_drift_refresh
+
+        scores = self._predict_student_scores(input_ids)
+        budget = min(self.student_budget, int(input_ids.shape[1]))
+        keep = torch.topk(scores.mean(dim=0), k=budget, largest=True).indices.sort().values
+        refresh_tokens = self.student_refresh_tokens or max(1, budget // 4)
+        return generate_with_drift_refresh(
+            input_ids=input_ids,
+            model=self.model,
+            keep_indices=keep,
+            refresh_tokens=refresh_tokens,
+            mode=self.student_drift_mode,
+            refresh_student=self.drift_refresh_student,
+            frozen_layers=self.student_drift_frozen_layers,
+            steps=int(gen_kwargs.get("steps")),
+            gen_length=int(gen_kwargs.get("gen_length")),
+            block_length=int(gen_kwargs.get("block_length")),
+            temperature=float(gen_kwargs.get("temperature", 0.0) or 0.0),
             cfg_scale=float(gen_kwargs.get("cfg_scale", 0.0) or 0.0),
             remasking=gen_kwargs.get("remasking") or "low_confidence",
             mask_id=self.mask_id,
@@ -1179,6 +1256,8 @@ class LLaDA(TemplateLM):
             )
             if self.student_prompt_pool_active:
                 out = self._generate_with_student_prompt_pool_active(context_enc, gen_kwargs)
+            elif self.student_prompt_drift_refresh:
+                out = self._generate_with_drift_refresh(context_enc, gen_kwargs)
             elif self.student_prompt_layer_split:
                 out = self._generate_with_student_layer_split(context_enc, gen_kwargs)
             elif self.student_prompt_dynamic_kv:
