@@ -290,6 +290,20 @@ def teacher_targets_from_record(rec: dict, config: TrainConfig) -> torch.Tensor:
             if "drift_cumulative" in rec:
                 return rec["drift_cumulative"].float().unsqueeze(0)
             raise RuntimeError("target-mode=drift requires drift_weighted or drift_cumulative in teacher record")
+        case "hybrid_mask":
+            if "hybrid_mask" not in rec:
+                raise RuntimeError("target-mode=hybrid_mask requires hybrid_mask in label record")
+            target = rec["hybrid_mask"].float()
+            if target.ndim != 2:
+                raise RuntimeError("hybrid_mask must have shape [layer, prompt]")
+            return target.unsqueeze(0)
+        case "delta":
+            if "delta_norm" not in rec:
+                raise RuntimeError("target-mode=delta requires delta_norm in teacher record")
+            target = rec["delta_norm"].float()
+            if target.ndim != 2:
+                raise RuntimeError("delta_norm must have shape [layer, prompt]")
+            return target.unsqueeze(0)
         case "step":
             if "future_step_masks" not in rec:
                 raise RuntimeError("target-mode=step requires future_step_masks in teacher record")

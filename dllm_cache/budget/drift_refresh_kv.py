@@ -5,7 +5,7 @@ across layers). What this module decides is the *time* axis: at every denoising 
 every layer, which R of the kept tokens get their K/V recomputed and which keep serving
 the stale cache.
 
-Two selectors:
+Selectors:
 
   oracle   r*_{t,l,i} = s*_{t,l,i} . d^V_{t,l,i}
            s* = suffix->kept attention mass over the positions committing this step
@@ -15,9 +15,14 @@ Two selectors:
   student  z = f(prompt/state features) from a trained RefreshStudent -- no fresh values
            needed, so this is the deployable version the oracle bounds.
 
-Both run the same loop: a shadow forward over [kept ; suffix] supplies fresh K/V, the
-selected R positions are written into the served cache, and a suffix-only forward against
-the served cache produces the logits that actually drive the commit.
+  delta_student  re-applies the offline delta PromptUtilityStudent to the currently
+           served prompt hidden states at every denoising step.  Layer probabilities
+           are pooled before a global top-R is selected, so all layers update the same
+           tokens while the selected set can change from one step to the next.
+
+The oracle uses a shadow forward over every kept token.  The deployable selectors instead
+re-score cached inference-time state and forward only the selected R prompt tokens plus the
+suffix.
 """
 
 from __future__ import annotations
@@ -42,6 +47,7 @@ __all__ = [
     "RefreshStudent",
     "load_refresh_student",
     "generate_with_drift_refresh",
+    "select_delta_student_topk",
 ]
 
 
@@ -78,6 +84,42 @@ def load_refresh_student(ckpt_path, device: str) -> RefreshStudent:
     student = RefreshStudent(proj=cfg.get("proj_dim", 256), mlp=cfg.get("mlp_dim", 512))
     student.load_state_dict(ckpt["state_dict"])
     return student.to(device).eval()
+
+
+@torch.inference_mode()
+def select_delta_student_topk(
+    student: nn.Module,
+    hidden: list[torch.Tensor],
+    keep_positions: torch.Tensor,
+    prompt_length: int,
+    question_window: int,
+    refresh_tokens: int,
+) -> torch.Tensor:
+    """Re-score the current served prompt state and return one global refresh set."""
+    if not hidden:
+        raise RuntimeError("delta student refresh needs cached prompt hidden states")
+    keep_count = int(keep_positions.numel())
+    if not 0 < refresh_tokens <= keep_count:
+        raise RuntimeError("refresh_tokens must fall inside the kept prompt")
+    prompt_indices = torch.arange(keep_count, device=keep_positions.device)
+    question_start = max(0, prompt_length - max(1, question_window))
+    question_indices = torch.nonzero(
+        keep_positions >= question_start, as_tuple=False
+    ).squeeze(-1)
+    if question_indices.numel() == 0:
+        question_indices = prompt_indices[-1:]
+
+    probabilities = []
+    for layer_id, layer_hidden in enumerate(hidden):
+        scores = student.forward_layer(
+            layer_id,
+            layer_hidden.float(),
+            prompt_indices,
+            question_indices,
+        )
+        probabilities.append(torch.softmax(scores.float(), dim=-1).squeeze(0))
+    pooled = torch.stack(probabilities).mean(dim=0)
+    return torch.topk(pooled, k=refresh_tokens, largest=True).indices.sort().values
 
 
 def _embed(decoder, ids):
@@ -152,6 +194,7 @@ def _student_step_forward(
     model, suffix_ids, suffix_positions, keep_positions,
     hidden, served_k, served_v, student, u_all, q_all, c_t, age, step_frac, R,
     frozen_layers=0,
+    due_indices=None,
 ):
     """One denoising step where only the R student-chosen kept tokens are recomputed.
 
@@ -182,7 +225,9 @@ def _student_step_forward(
             x = run_block_mlp(block, x)
             continue
 
-        if student is None:  # random control: same budget, no learned ranking
+        if due_indices is not None:
+            due = due_indices
+        elif student is None:  # random control: same budget, no learned ranking
             due = torch.randperm(hidden[layer_id].shape[1], device=x.device)[:R]
         else:
             score = student(u_all[layer_id], q_all[layer_id], c_t, age[layer_id], step_frac, layer_id)
@@ -251,7 +296,9 @@ def generate_with_drift_refresh(
     refresh_tokens: int,
     mode: str = "oracle",
     refresh_student: RefreshStudent | None = None,
+    delta_student: nn.Module | None = None,
     frozen_layers: int = 0,
+    question_window: int = 128,
     steps: int = 128,
     gen_length: int = 128,
     block_length: int = 32,
@@ -262,10 +309,12 @@ def generate_with_drift_refresh(
 ) -> torch.Tensor:
     if cfg_scale and float(cfg_scale) > 0.0:
         raise RuntimeError("drift refresh generation does not support cfg_scale")
-    if mode not in {"oracle", "student", "random"}:
+    if mode not in {"oracle", "student", "random", "delta_student"}:
         raise RuntimeError(f"unsupported drift refresh mode: {mode}")
     if mode == "student" and refresh_student is None:
         raise RuntimeError("student mode requires a trained refresh student")
+    if mode == "delta_student" and delta_student is None:
+        raise RuntimeError("delta_student mode requires the offline delta student")
 
     device = input_ids.device
     P = int(input_ids.shape[1])
@@ -294,7 +343,7 @@ def generate_with_drift_refresh(
     served_v: list[torch.Tensor | None] = [None] * L
     age = torch.zeros(L, nkeep, dtype=torch.long, device=device)
     hidden = None
-    if mode in {"student", "random"} and 0 < R < nkeep:
+    if mode in {"student", "random", "delta_student"} and 0 < R < nkeep:
         # Cheap path: prefill once, then only the R chosen tokens are recomputed per step.
         hidden, served_k, served_v = _prefill_kept_states(
             model, kept_ids, x[:, P:], keep_positions, suffix_positions
@@ -308,6 +357,11 @@ def generate_with_drift_refresh(
     steps_per_block = steps // num_blocks
 
     gstep = 0
+    previous_due_mask = None
+    due_jaccard_sum = 0.0
+    due_comparisons = 0
+    changed_due_steps = 0
+    ever_due = torch.zeros(nkeep, dtype=torch.bool, device=device)
     for nb in range(num_blocks):
         start = P + nb * block_length
         end = P + (nb + 1) * block_length
@@ -324,11 +378,32 @@ def generate_with_drift_refresh(
                     committed = x[0, P:] != mask_id
                     c_t = (decoder.transformer.wte(x[0, P:][committed]).float().mean(0)
                            if committed.any() else q_all[0])
+                due_indices = None
+                if mode == "delta_student":
+                    due_indices = select_delta_student_topk(
+                        delta_student,
+                        hidden,
+                        keep_positions,
+                        prompt_length=P,
+                        question_window=question_window,
+                        refresh_tokens=R,
+                    )
+                    due_mask = torch.zeros_like(ever_due)
+                    due_mask[due_indices] = True
+                    ever_due |= due_mask
+                    if previous_due_mask is not None:
+                        intersection = int((due_mask & previous_due_mask).sum().item())
+                        union = int((due_mask | previous_due_mask).sum().item())
+                        due_jaccard_sum += intersection / max(1, union)
+                        due_comparisons += 1
+                        changed_due_steps += int(not torch.equal(due_mask, previous_due_mask))
+                    previous_due_mask = due_mask
                 logits = _student_step_forward(
                     model, suffix_ids, suffix_positions, keep_positions,
                     hidden, served_k, served_v, refresh_student,
                     u_all, q_all, c_t, age, gstep / steps, R,
                     frozen_layers=frozen_layers,
+                    due_indices=due_indices,
                 )
                 x, gstep = _commit(
                     x, P, logits, nb, block_length, k_commit, temperature, remasking,
@@ -353,7 +428,7 @@ def generate_with_drift_refresh(
                                         torch.full_like(conf[blk], float("-inf")))
                 s_idx = (torch.topk(cand, k=min(k_commit, int(torch.isfinite(cand).sum()))).indices
                          if k_commit > 0 else torch.arange(0, device=device))
-            else:
+            elif mode == "student":
                 committed = x[0, P:] != mask_id
                 c_t = (decoder.transformer.wte(x[0, P:][committed]).float().mean(0)
                        if committed.any() else q_all[0])
@@ -389,6 +464,14 @@ def generate_with_drift_refresh(
                 x, P, logits, nb, block_length, k_commit, temperature, remasking,
                 mask_id, gstep,
             )
+    if mode == "delta_student":
+        mean_jaccard = due_jaccard_sum / max(1, due_comparisons)
+        print(
+            f"[delta-student-refresh] steps={gstep} changed_steps={changed_due_steps}/"
+            f"{due_comparisons} mean_adjacent_jaccard={mean_jaccard:.4f} "
+            f"unique_refreshed={int(ever_due.sum().item())}/{nkeep}",
+            flush=True,
+        )
     return x[:, P:]
 
 

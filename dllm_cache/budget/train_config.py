@@ -53,7 +53,19 @@ def parse_train_config() -> TrainConfig:
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=0.0)
-    parser.add_argument("--target-mode", choices=["score", "frequency", "union", "step", "drift"], default="score")
+    parser.add_argument(
+        "--target-mode",
+        choices=[
+            "score",
+            "frequency",
+            "union",
+            "step",
+            "drift",
+            "hybrid_mask",
+            "delta",
+        ],
+        default="score",
+    )
     parser.add_argument("--loss-mode", choices=["auto", "mse", "bce"], default="auto")
     parser.add_argument("--bce-positive-weight", type=float, default=None)
     parser.add_argument("--rank-weight", type=float, default=0.1)
@@ -108,7 +120,7 @@ def parse_train_config() -> TrainConfig:
 def resolve_loss_mode(target_mode: str, loss_mode: str) -> str:
     if loss_mode != "auto":
         return loss_mode
-    if target_mode in {"frequency", "union", "step"}:
+    if target_mode in {"frequency", "union", "step", "hybrid_mask"}:
         return "bce"
     return "mse"
 

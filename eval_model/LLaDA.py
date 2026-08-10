@@ -150,8 +150,10 @@ class LLaDA(TemplateLM):
         # student_prompt_* generation mode.
         self.maskkv_student_scores = self._coerce_bool(maskkv_student_scores)
         self.student_drift_mode = str(student_drift_mode)
-        if self.student_drift_mode not in {"oracle", "student", "random"}:
-            raise RuntimeError("student_drift_mode must be 'oracle', 'student' or 'random'")
+        if self.student_drift_mode not in {"oracle", "student", "random", "delta_student"}:
+            raise RuntimeError(
+                "student_drift_mode must be 'oracle', 'student', 'random' or 'delta_student'"
+            )
         self.student_drift_ckpt = student_drift_ckpt
         # Drift says the shallow layers barely move, so refreshing them is wasted work.
         self.student_drift_frozen_layers = int(student_drift_frozen_layers)
@@ -679,8 +681,9 @@ class LLaDA(TemplateLM):
         """Keep set from the importance student; refresh set chosen per step by drift.
 
         `student_drift_mode=oracle` ranks by the measured r* = attention x value staleness
-        (an upper bound, it needs the fresh values); `student` uses the trained refresh
-        student, which sees only inference-time features.
+        (an upper bound, it needs the fresh values); `delta_student` re-scores the current
+        served prompt states with the offline delta student every step; `student` uses the
+        separately trained online refresh student.
         """
         from dllm_cache.budget.drift_refresh_kv import generate_with_drift_refresh
 
@@ -695,7 +698,9 @@ class LLaDA(TemplateLM):
             refresh_tokens=refresh_tokens,
             mode=self.student_drift_mode,
             refresh_student=self.drift_refresh_student,
+            delta_student=self.refresh_student,
             frozen_layers=self.student_drift_frozen_layers,
+            question_window=self.student_question_window,
             steps=int(gen_kwargs.get("steps")),
             gen_length=int(gen_kwargs.get("gen_length")),
             block_length=int(gen_kwargs.get("block_length")),

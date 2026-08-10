@@ -7,6 +7,11 @@ from dllm_cache.budget.hybrid_labels import (
     mask_jaccard,
     sample_generator,
 )
+from dllm_cache.budget.train_config import (
+    resolve_bce_positive_weight,
+    resolve_loss_mode,
+)
+from dllm_cache.budget.training_loop import teacher_targets_from_record
 
 
 def scores_pair() -> tuple[torch.Tensor, torch.Tensor]:
@@ -68,6 +73,30 @@ def test_jaccard_matches_hand_computation() -> None:
     result = build_hybrid_label_masks(ref, delta, budget=4, ref_k=2, generator=sample_generator(0, "s"))
     # top-4 of ref = {0,1,2,3}, top-4 of delta = {4,5,6,7}: disjoint.
     assert torch.allclose(result.ref_delta_jaccard, torch.zeros(2))
+
+
+def test_hybrid_mask_is_a_binary_bce_training_target() -> None:
+    mask = torch.tensor(
+        [
+            [True, False, True, False],
+            [False, True, False, True],
+        ]
+    )
+    config = type("Config", (), {"target_mode": "hybrid_mask"})()
+    target = teacher_targets_from_record({"hybrid_mask": mask}, config)
+    assert target.shape == (1, 2, 4)
+    assert torch.equal(target, mask.float().unsqueeze(0))
+    assert resolve_loss_mode("hybrid_mask", "auto") == "bce"
+    assert resolve_bce_positive_weight("hybrid_mask", None) == 1.0
+
+
+def test_delta_norm_is_a_score_training_target() -> None:
+    delta = torch.tensor([[0.1, 0.2, 0.7], [0.3, 0.3, 0.4]])
+    config = type("Config", (), {"target_mode": "delta"})()
+    target = teacher_targets_from_record({"delta_norm": delta}, config)
+    assert target.shape == (1, 2, 3)
+    assert torch.equal(target, delta.unsqueeze(0))
+    assert resolve_loss_mode("delta", "auto") == "mse"
 
 
 if __name__ == "__main__":
