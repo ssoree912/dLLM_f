@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 import torch.nn as nn
@@ -35,6 +35,7 @@ class FuturePoolTeacherResult:
     generated_ids: torch.Tensor
     teacher_raw: torch.Tensor
     teacher_norm: torch.Tensor
+    future_step_masks: torch.Tensor
     future_frequency: torch.Tensor
     future_frequency_count: torch.Tensor
     union_mask: torch.Tensor
@@ -52,6 +53,7 @@ class FuturePoolTrace:
     union_mask: torch.Tensor
     confidence_weight: bool
     active_top_k: int
+    step_masks: list[torch.Tensor] = field(default_factory=list)
     frequency_denominator: int = 0
     commit_count: int = 0
     weight_sum: float = 0.0
@@ -127,10 +129,12 @@ def generate_with_future_pool_teacher(
     denominator = max(1, trace.frequency_denominator)
     future_frequency_count = trace.frequency_count.detach().cpu()
     future_frequency = future_frequency_count.float() / float(denominator)
+    future_step_masks = stack_step_masks(trace.step_masks, layer_count, prompt_length).detach().cpu()
     return FuturePoolTeacherResult(
         generated_ids=suffix_ids.detach().cpu().squeeze(0),
         teacher_raw=teacher_raw,
         teacher_norm=teacher_norm,
+        future_step_masks=future_step_masks,
         future_frequency=future_frequency,
         future_frequency_count=future_frequency_count,
         union_mask=trace.union_mask.detach().cpu(),
@@ -165,10 +169,12 @@ def accumulate_future_pool(
     weights = confidence[0].index_select(0, selected).clamp_min(0.0).float()
     if not trace.confidence_weight:
         weights = torch.ones_like(weights, dtype=torch.float32)
+    step_mask = torch.zeros_like(trace.union_mask)
     for layer_id, layer_attention in prompt_attention.items():
         scores = (layer_attention.index_select(0, selected).float() * weights.unsqueeze(-1)).sum(dim=0)
         top_count = min(trace.active_top_k, int(scores.numel()))
         top_indices = torch.topk(scores, k=top_count, largest=True).indices
+        step_mask[layer_id].scatter_(dim=0, index=top_indices, value=True)
         trace.union_mask[layer_id].scatter_(dim=0, index=top_indices, value=True)
         trace.frequency_count[layer_id].scatter_add_(
             dim=0,
@@ -177,9 +183,16 @@ def accumulate_future_pool(
         )
         trace.sum_scores[layer_id] += scores
         trace.max_scores[layer_id] = torch.maximum(trace.max_scores[layer_id], scores)
+    trace.step_masks.append(step_mask)
     trace.frequency_denominator += 1
     trace.commit_count += int(selected.numel())
     trace.weight_sum += float(weights.sum().detach().cpu())
+
+
+def stack_step_masks(step_masks: list[torch.Tensor], layer_count: int, prompt_length: int) -> torch.Tensor:
+    if step_masks:
+        return torch.stack(step_masks, dim=0)
+    return torch.zeros((0, layer_count, prompt_length), dtype=torch.bool)
 
 
 def normalize_scores(raw: torch.Tensor) -> torch.Tensor:

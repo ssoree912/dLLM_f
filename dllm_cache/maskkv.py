@@ -1,3 +1,4 @@
+import os
 from dataclasses import dataclass
 from math import sqrt
 
@@ -17,6 +18,7 @@ class MaskKVAttentionRequest:
     budget: int
     layer_base_rate: float
     head_base_rate: float
+    student_scores: torch.Tensor | None = None
 
 
 def maskkv_scaled_dot_product_attention(
@@ -41,9 +43,35 @@ def maskkv_scaled_dot_product_attention(
     scale = 1.0 / sqrt(request.q.shape[-1])
     scores = torch.matmul(mask_queries, request.k.transpose(-1, -2)) * scale
     attention = torch.softmax(scores.float(), dim=-1).to(dtype=request.q.dtype)
-    prompt_scores = attention[..., :prompt_length].sum(dim=-2)
+    prompt_scores = _prompt_scores(request, attention, prompt_length)
     head_budgets = _head_budgets(attention, request, layer_budget)
     return _attention_with_selected_prompt_tokens(request, prompt_scores, head_budgets)
+
+
+def _prompt_scores(
+    request: MaskKVAttentionRequest,
+    attention: torch.Tensor,
+    prompt_length: int,
+) -> torch.Tensor:
+    """Rank prompt tokens by the utility student when it has spoken, else by attention.
+
+    MaskKV's own ranking is this step's mask->prompt attention mass. The student instead
+    predicts how much a position matters over the whole trajectory, which is what the
+    keep decision actually needs; the budget split per layer and per head stays MaskKV's.
+    Student scores are per layer, so every head in a layer ranks alike and the head
+    budgets decide how deep into that ranking each head keeps.
+    """
+    scores = request.student_scores
+    if scores is None:
+        return attention[..., :prompt_length].sum(dim=-2)
+    layer_scores = scores[request.layer_id].to(
+        device=attention.device, dtype=attention.dtype
+    )
+    if layer_scores.shape[-1] < prompt_length:
+        return attention[..., :prompt_length].sum(dim=-2)
+    layer_scores = layer_scores[:prompt_length]
+    batch, heads = attention.shape[0], attention.shape[1]
+    return layer_scores.view(1, 1, -1).expand(batch, heads, -1)
 
 
 def _can_prune(request: MaskKVAttentionRequest) -> bool:
@@ -72,13 +100,41 @@ def _gather_mask_queries(q: torch.Tensor, mask_index: torch.Tensor) -> torch.Ten
 
 
 def _layer_budget(request: MaskKVAttentionRequest) -> int:
-    if request.layer_count <= 1:
+    """Split a fixed pool across layers: flat floor first, the rest by importance.
+
+    `budget` is the per-layer *average*, so the pool is L x budget and it is preserved:
+    every layer gets k_base = floor(beta x budget) unconditionally, and the remaining
+    L x (budget - k_base) is handed out in proportion to the layer profile. Scaling each
+    layer by a rate instead (the earlier form) shrinks the pool -- with beta=0.4 it spent
+    only 71% of it, so a run was never comparable to a uniform baseline at the same
+    nominal budget.
+    """
+    layer_count = request.layer_count
+    if layer_count <= 1:
         return min(request.budget, request.prompt_length)
-    center = (request.layer_count - 1) / 2
-    distance = abs(request.layer_id - center) / center
-    rate = request.layer_base_rate + (1.0 - request.layer_base_rate) * distance
-    budget = round(request.budget * rate)
+    base = int(request.layer_base_rate * request.budget)
+    pool = layer_count * (request.budget - base)
+    weights = _layer_profile(layer_count)
+    share = weights[request.layer_id] / sum(weights)
+    budget = base + int(pool * share)
     return max(1, min(request.prompt_length, budget))
+
+
+def _layer_profile(layer_count: int) -> list[float]:
+    """Relative importance per layer, used to hand out the non-flat part of the pool.
+
+    Defaults to distance from the middle of the stack, i.e. the assumption that the
+    middle layers are the redundant ones. MASKKV_LAYER_PROFILE overrides it with a
+    comma-separated measured profile (one value per layer) so the split can follow what
+    the drift measurement actually shows on this model rather than the assumption.
+    """
+    override = os.getenv("MASKKV_LAYER_PROFILE", "")
+    if override:
+        values = [float(v) for v in override.split(",") if v.strip()]
+        if len(values) == layer_count and sum(values) > 0:
+            return [max(0.0, v) for v in values]
+    center = (layer_count - 1) / 2
+    return [abs(layer_id - center) / center for layer_id in range(layer_count)]
 
 
 def _head_budgets(

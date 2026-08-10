@@ -30,6 +30,7 @@ class DriftConfig:
     block_length: int
     repeats: int
     question_window: int
+    apply_chat_template: bool
 
 
 SAMSUM_INSTRUCTION = (
@@ -72,7 +73,14 @@ def run(config: DriftConfig) -> Path:
     prompt_cap = config.max_length - config.gen_length
 
     for index, row in enumerate(rows, start=1):
-        encoded = tokenizer(build_prompt(row), add_special_tokens=False)["input_ids"]
+        text = build_prompt(row)
+        if config.apply_chat_template:
+            text = tokenizer.apply_chat_template(
+                [{"role": "user", "content": text}],
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+        encoded = tokenizer(text, add_special_tokens=False)["input_ids"]
         prompt_ids = torch.tensor(
             [[int(token) for token in encoded][-prompt_cap:]],
             dtype=torch.long,
@@ -148,6 +156,11 @@ def parse_args(argv: Sequence[str] | None = None) -> DriftConfig:
         help="generations per prompt; >1 tests whether drift reproduces",
     )
     parser.add_argument("--question-window", type=int, default=128)
+    parser.add_argument(
+        "--apply-chat-template",
+        action="store_true",
+        help="match the harness prompt wrapping used at inference",
+    )
     args = parser.parse_args(argv)
     return DriftConfig(
         model_path=args.model,
@@ -162,6 +175,7 @@ def parse_args(argv: Sequence[str] | None = None) -> DriftConfig:
         block_length=args.block_length,
         repeats=args.repeats,
         question_window=args.question_window,
+        apply_chat_template=args.apply_chat_template,
     )
 
 

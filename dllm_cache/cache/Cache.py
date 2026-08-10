@@ -61,6 +61,8 @@ class dLLMCache(metaclass=Singleton):
         )
         self.__step_counter = defaultdict(lambda: defaultdict(lambda: 0))
         self.__mask_index = None
+        # prompt scores are set per sample from outside and must survive reset_cache(),
+        # which generate() calls after they have been handed over.
 
     def reset_cache(self, prompt_length: int = 0) -> None:
         self.init()
@@ -74,6 +76,19 @@ class dLLMCache(metaclass=Singleton):
 
     def get_mask_index(self) -> torch.Tensor | None:
         return self.__mask_index
+
+    def set_prompt_scores(self, scores: torch.Tensor | None) -> None:
+        """Per-layer prompt importance, [layer, prompt], from the utility student.
+
+        MaskKV ranks prompt tokens by this step's mask->prompt attention. Handing it a
+        student prediction instead keeps MaskKV's layer/head budget split but selects
+        with our trained importance, which is the whole-trajectory quantity rather than
+        one step's attention.
+        """
+        self.__prompt_scores = None if scores is None else scores.detach()
+
+    def get_prompt_scores(self) -> torch.Tensor | None:
+        return getattr(self, "_dLLMCache__prompt_scores", None)
 
     def set_cache(
         self, layer_id: int, feature_name: str, features: torch.Tensor, cache_type: str

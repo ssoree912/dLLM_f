@@ -21,10 +21,14 @@ class TrainConfig:
     epochs: int
     lr: float
     weight_decay: float
+    target_mode: str
+    loss_mode: str
+    bce_positive_weight: float
     rank_weight: float
     rank_margin: float
     rank_top_ratio: float
     rank_bottom_ratio: float
+    rank_input: str
     topk_weight: float
     topk_k: int
     topk_positive_weight: float
@@ -49,10 +53,14 @@ def parse_train_config() -> TrainConfig:
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=0.0)
+    parser.add_argument("--target-mode", choices=["score", "frequency", "union", "step"], default="score")
+    parser.add_argument("--loss-mode", choices=["auto", "mse", "bce"], default="auto")
+    parser.add_argument("--bce-positive-weight", type=float, default=None)
     parser.add_argument("--rank-weight", type=float, default=0.1)
     parser.add_argument("--rank-margin", type=float, default=0.05)
     parser.add_argument("--rank-top-ratio", type=float, default=0.2)
     parser.add_argument("--rank-bottom-ratio", type=float, default=0.4)
+    parser.add_argument("--rank-input", choices=["auto", "prob", "logit"], default="auto")
     parser.add_argument("--topk-weight", type=float, default=0.0)
     parser.add_argument("--topk-k", type=int, default=128)
     parser.add_argument("--topk-positive-weight", type=float, default=8.0)
@@ -64,6 +72,7 @@ def parse_train_config() -> TrainConfig:
     parser.add_argument("--proj-dim", type=int, default=256)
     parser.add_argument("--mlp-dim", type=int, default=512)
     args = parser.parse_args()
+    loss_mode = resolve_loss_mode(args.target_mode, args.loss_mode)
     return TrainConfig(
         teacher_root=args.teacher_root,
         output_dir=args.output_dir,
@@ -75,10 +84,14 @@ def parse_train_config() -> TrainConfig:
         epochs=args.epochs,
         lr=args.lr,
         weight_decay=args.weight_decay,
+        target_mode=args.target_mode,
+        loss_mode=loss_mode,
+        bce_positive_weight=resolve_bce_positive_weight(args.target_mode, args.bce_positive_weight),
         rank_weight=args.rank_weight,
         rank_margin=args.rank_margin,
         rank_top_ratio=args.rank_top_ratio,
         rank_bottom_ratio=args.rank_bottom_ratio,
+        rank_input=resolve_rank_input(loss_mode, args.rank_input),
         topk_weight=args.topk_weight,
         topk_k=args.topk_k,
         topk_positive_weight=args.topk_positive_weight,
@@ -90,6 +103,30 @@ def parse_train_config() -> TrainConfig:
         proj_dim=args.proj_dim,
         mlp_dim=args.mlp_dim,
     )
+
+
+def resolve_loss_mode(target_mode: str, loss_mode: str) -> str:
+    if loss_mode != "auto":
+        return loss_mode
+    if target_mode in {"frequency", "union", "step"}:
+        return "bce"
+    return "mse"
+
+
+def resolve_bce_positive_weight(target_mode: str, bce_positive_weight: float | None) -> float:
+    if bce_positive_weight is not None:
+        return bce_positive_weight
+    if target_mode in {"frequency", "union", "step"}:
+        return 4.0
+    return 1.0
+
+
+def resolve_rank_input(loss_mode: str, rank_input: str) -> str:
+    if rank_input != "auto":
+        return rank_input
+    if loss_mode == "bce":
+        return "logit"
+    return "prob"
 
 
 def parse_dtype(dtype: str) -> torch.dtype:
@@ -116,10 +153,14 @@ def serializable_config(config: TrainConfig) -> dict[str, str | int | float | li
         "epochs": config.epochs,
         "lr": config.lr,
         "weight_decay": config.weight_decay,
+        "target_mode": config.target_mode,
+        "loss_mode": config.loss_mode,
+        "bce_positive_weight": config.bce_positive_weight,
         "rank_weight": config.rank_weight,
         "rank_margin": config.rank_margin,
         "rank_top_ratio": config.rank_top_ratio,
         "rank_bottom_ratio": config.rank_bottom_ratio,
+        "rank_input": config.rank_input,
         "topk_weight": config.topk_weight,
         "topk_k": config.topk_k,
         "topk_positive_weight": config.topk_positive_weight,

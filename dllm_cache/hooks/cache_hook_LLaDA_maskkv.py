@@ -91,6 +91,7 @@ def _maskkv_attention(
             budget=feature_cache.maskkv_budget,
             layer_base_rate=feature_cache.maskkv_layer_base_rate,
             head_base_rate=feature_cache.maskkv_head_base_rate,
+            student_scores=feature_cache.get_prompt_scores(),
         )
         att = maskkv_scaled_dot_product_attention(request)
     if att is None:

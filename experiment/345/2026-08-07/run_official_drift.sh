@@ -5,7 +5,12 @@
 # 기본은 samsum + chat template. trec 은 CHAT=0 으로 호출한다.
 set -uo pipefail
 REPO="/mnt/srv/home/dlpcg.325/dllm/dLLM-Cache"; cd "$REPO"
-export CUDA_VISIBLE_DEVICES=0 MASKKV_ENABLED=0 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export CUDA_VISIBLE_DEVICES=0 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+# MaskKV knobs pass through; default off so the other modes are unaffected.
+export MASKKV_ENABLED="${MASKKV_ENABLED:-0}"
+export MASKKV_BUDGET="${MASKKV_BUDGET:-0}"
+export MASKKV_LAYER_BASE_RATE="${MASKKV_LAYER_BASE_RATE:-1.0}"
+export MASKKV_HEAD_BASE_RATE="${MASKKV_HEAD_BASE_RATE:-1.0}"
 export HF_ALLOW_CODE_EVAL=1 HF_DATASETS_TRUST_REMOTE_CODE=true
 M="/mnt/srv/home/dlpcg.325/dllm/model/LLaDA-8B-Instruct"
 TASK_PATH="${REPO}/experiment/345/2026-08-07/tasks/longbench_local"

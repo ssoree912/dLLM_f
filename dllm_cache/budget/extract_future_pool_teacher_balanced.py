@@ -53,6 +53,7 @@ class ExtractFuturePoolConfig:
     min_raw_length: int
     skip_matching_samples: int
     prompt_format: str
+    apply_chat_template: bool
     fewshot_context_chars: int
 
 
@@ -79,6 +80,12 @@ def parse_args() -> ExtractFuturePoolConfig:
     parser.add_argument("--skip-matching-samples", type=int, default=0)
     parser.add_argument("--prompt-format", choices=["train", "samsum-eval-fewshot", "longbench-local"], default="train")
     parser.add_argument("--fewshot-context-chars", type=int, default=35000)
+    parser.add_argument(
+        "--apply-chat-template",
+        action="store_true",
+        help="wrap the prompt the way the harness does, so the student conditions on "
+             "the same span it will see at inference",
+    )
     args = parser.parse_args()
     return ExtractFuturePoolConfig(
         model_path=args.model,
@@ -101,6 +108,7 @@ def parse_args() -> ExtractFuturePoolConfig:
         min_raw_length=args.min_raw_length,
         skip_matching_samples=args.skip_matching_samples,
         prompt_format=args.prompt_format,
+        apply_chat_template=args.apply_chat_template,
         fewshot_context_chars=args.fewshot_context_chars,
     )
 
@@ -186,6 +194,14 @@ def tokenize_prompt_only(
     config: ExtractFuturePoolConfig,
 ) -> PromptOnlyExample:
     prompt_text = build_prompt_text(sample, config.prompt_format)
+    if config.apply_chat_template:
+        # lm_eval wraps prompts for instruct models, so a teacher extracted on the
+        # bare text conditions the student on a span it never sees at inference.
+        prompt_text = tokenizer.apply_chat_template(
+            [{"role": "user", "content": prompt_text}],
+            tokenize=False,
+            add_generation_prompt=True,
+        )
     prompt_ids_full = encode_text(tokenizer, prompt_text)
     prompt_cap = max(1, config.max_length - config.gen_length)
     truncation_offset = max(0, len(prompt_ids_full) - prompt_cap)
@@ -283,6 +299,7 @@ def extract_one(
         "teacher_kind": "future_temporal_union_pool",
         "teacher_formula": (
             "mask_union_t top_active_k(sum_committed_suffix_attention_t); "
+            "future_step_masks_t stores each denoising-step top_active_k; "
             "future_frequency_i=count_t(i in top_active_k)/active_update_steps"
         ),
         "teacher_graph": "full_sequence_prompt_suffix",
@@ -299,6 +316,8 @@ def extract_one(
         "question_token_indices": example.question_indices,
         "teacher_raw": result.teacher_raw.to(torch.float16),
         "teacher_norm": result.teacher_norm.to(torch.float16),
+        "future_step_masks": result.future_step_masks,
+        "future_step_count": int(result.future_step_masks.shape[0]),
         "future_frequency": result.future_frequency.to(torch.float16),
         "future_frequency_count": result.future_frequency_count,
         "future_union_mask": result.union_mask,

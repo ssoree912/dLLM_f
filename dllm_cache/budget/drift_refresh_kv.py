@@ -182,8 +182,11 @@ def _student_step_forward(
             x = run_block_mlp(block, x)
             continue
 
-        score = student(u_all[layer_id], q_all[layer_id], c_t, age[layer_id], step_frac, layer_id)
-        due = torch.topk(score, k=R).indices
+        if student is None:  # random control: same budget, no learned ranking
+            due = torch.randperm(hidden[layer_id].shape[1], device=x.device)[:R]
+        else:
+            score = student(u_all[layer_id], q_all[layer_id], c_t, age[layer_id], step_frac, layer_id)
+            due = torch.topk(score, k=R).indices
 
         h_sel = hidden[layer_id].index_select(1, due)
         qk, kk, vk = project_qkv(block, h_sel)
@@ -259,7 +262,7 @@ def generate_with_drift_refresh(
 ) -> torch.Tensor:
     if cfg_scale and float(cfg_scale) > 0.0:
         raise RuntimeError("drift refresh generation does not support cfg_scale")
-    if mode not in {"oracle", "student"}:
+    if mode not in {"oracle", "student", "random"}:
         raise RuntimeError(f"unsupported drift refresh mode: {mode}")
     if mode == "student" and refresh_student is None:
         raise RuntimeError("student mode requires a trained refresh student")
@@ -291,7 +294,7 @@ def generate_with_drift_refresh(
     served_v: list[torch.Tensor | None] = [None] * L
     age = torch.zeros(L, nkeep, dtype=torch.long, device=device)
     hidden = None
-    if mode == "student" and 0 < R < nkeep:
+    if mode in {"student", "random"} and 0 < R < nkeep:
         # Cheap path: prefill once, then only the R chosen tokens are recomputed per step.
         hidden, served_k, served_v = _prefill_kept_states(
             model, kept_ids, x[:, P:], keep_positions, suffix_positions
@@ -315,10 +318,12 @@ def generate_with_drift_refresh(
             k_commit = int(ntt[0, si].item())
 
             if hidden is not None:
-                # student cheap path: no shadow forward, only R tokens recomputed
-                committed = x[0, P:] != mask_id
-                c_t = (decoder.transformer.wte(x[0, P:][committed]).float().mean(0)
-                       if committed.any() else q_all[0])
+                # cheap path: no shadow forward, only R tokens recomputed
+                c_t = None
+                if refresh_student is not None:
+                    committed = x[0, P:] != mask_id
+                    c_t = (decoder.transformer.wte(x[0, P:][committed]).float().mean(0)
+                           if committed.any() else q_all[0])
                 logits = _student_step_forward(
                     model, suffix_ids, suffix_positions, keep_positions,
                     hidden, served_k, served_v, refresh_student,

@@ -100,10 +100,34 @@ class LayerSplitPromptCache:
     hidden: dict[int, torch.Tensor] = field(default_factory=dict)
     attn: dict[int, torch.Tensor] = field(default_factory=dict)
     measured_tokens: int = 0
+    # Measuring movement only tells us which cached positions we already know are
+    # wrong. A position the top-K never reaches keeps drifting unobserved, so every
+    # `full_refresh_interval` steps the deep layers recompute the whole kept prompt
+    # and reset the baselines the ranking is measured against. Zero disables it.
+    full_refresh_interval: int = 0
+    step: int = 0
+    # What the per-step movement is measured against.
+    #   "refresh" -- the position's own last refresh, so `moved` is the error that
+    #                has accumulated while it sat stale. Refreshing resets it to
+    #                zero, which pushes the position to the bottom of the ranking
+    #                and spreads the budget over time.
+    #   "step"    -- the previous step for every position, so `moved` is current
+    #                velocity. Nothing resets, so the budget can stay parked on
+    #                whichever positions the suffix is actively reading.
+    measured_baseline: str = "refresh"
 
     @property
     def measures(self) -> bool:
         return self.measured_tokens > 0
+
+    def full_refresh_due(self) -> bool:
+        """Whether this step recomputes every kept position instead of the top-K.
+
+        Step 0 is never due: the caches were just written by the prefill, so a
+        full pass there would repeat work that is already exact.
+        """
+        interval = self.full_refresh_interval
+        return interval > 0 and self.step > 0 and self.step % interval == 0
 
     @property
     def rotates(self) -> bool:
@@ -171,6 +195,8 @@ def build_layer_split_prompt_cache(
     refresh_scores: torch.Tensor | None = None,
     rotate_steps: int = 0,
     measured_tokens: int = 0,
+    full_refresh_interval: int = 0,
+    measured_baseline: str = "refresh",
 ) -> LayerSplitPromptCache:
     """Prefill the whole prompt once, then keep only what the split needs.
 
@@ -227,7 +253,11 @@ def build_layer_split_prompt_cache(
         stale_indices=stale,
     )
     if measuring:
+        if measured_baseline not in {"refresh", "step"}:
+            raise RuntimeError("measured_baseline must be 'refresh' or 'step'")
         cache.measured_tokens = measured_tokens
+        cache.full_refresh_interval = max(0, full_refresh_interval)
+        cache.measured_baseline = measured_baseline
     if rotating:
         if refresh_scores is None:
             rotation_weight = torch.ones(keep_count)
@@ -473,14 +503,16 @@ def measured_suffix_logits(
         dtype=torch.long,
     )
     prompt_positions = cache.keep_indices.to(x.device)
+    full = cache.full_refresh_due()
 
     for layer_id, block in enumerate(decoder.transformer.blocks):
         if layer_id < cache.frozen_layers:
             x = _run_frozen_block(block, x, suffix_positions, cache)
         else:
             x = _run_measured_block(
-                block, x, prompt_positions, suffix_positions, cache
+                block, x, prompt_positions, suffix_positions, cache, full=full
             )
+    cache.step += 1
     return suffix_logits_from_hidden(decoder, x)
 
 
@@ -490,6 +522,7 @@ def _run_measured_block(
     prompt_positions: torch.Tensor,
     suffix_positions: torch.Tensor,
     cache: LayerSplitPromptCache,
+    full: bool = False,
 ) -> torch.Tensor:
     layer_id = int(block.layer_id)
     hidden = cache.hidden[layer_id]
@@ -517,14 +550,22 @@ def _run_measured_block(
     # error is whatever has accumulated since it was last written. Drift saturates
     # -- 2-3% per step but only 0.13-0.37 in total -- so a per-step delta looks
     # nearly uniform across positions and would never surface a long-stale one.
-    previous = cache.attn[layer_id].to(device=att_p.device, dtype=att_p.dtype)
-    moved = 1.0 - F.cosine_similarity(att_p.float(), previous.float(), dim=-1)
-    due = torch.topk(moved.squeeze(0), k=cache.measured_tokens, largest=True).indices
+    if full:
+        # Nothing to rank: every kept position is rewritten, which also re-bases
+        # the attention the next few steps measure movement against.
+        due = torch.arange(prompt_hidden.shape[1], device=att_p.device)
+    else:
+        previous = cache.attn[layer_id].to(device=att_p.device, dtype=att_p.dtype)
+        moved = 1.0 - F.cosine_similarity(att_p.float(), previous.float(), dim=-1)
+        due = torch.topk(moved.squeeze(0), k=cache.measured_tokens, largest=True).indices
 
     slots = due.view(1, -1, 1).expand(1, -1, prompt_hidden.shape[-1])
-    cache.attn[layer_id].scatter_(
-        1, slots, torch.gather(att_p, 1, slots).detach().to(cache.attn[layer_id].dtype)
-    )
+    if cache.measured_baseline == "step":
+        cache.attn[layer_id].copy_(att_p.detach().to(cache.attn[layer_id].dtype))
+    else:
+        cache.attn[layer_id].scatter_(
+            1, slots, torch.gather(att_p, 1, slots).detach().to(cache.attn[layer_id].dtype)
+        )
     selected_hidden = torch.gather(prompt_hidden, 1, slots)
     selected_att = torch.gather(att_p, 1, slots)
     updated = selected_hidden + block.dropout(block.attn_out(selected_att))

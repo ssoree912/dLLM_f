@@ -106,6 +106,7 @@ class LLaDA(TemplateLM):
         student_prompt_dynamic_kv: bool = False,
         student_prompt_layer_split: bool = False,
         student_prompt_drift_refresh: bool = False,
+        maskkv_student_scores: bool = False,
         student_drift_mode: str = "oracle",
         student_drift_ckpt: Optional[str] = None,
         student_drift_frozen_layers: int = 0,
@@ -115,6 +116,7 @@ class LLaDA(TemplateLM):
         student_refresh_rotate: bool = False,
         student_measured_tokens: int = 0,
         student_full_refresh_interval: int = 0,
+        student_measured_baseline: str = "refresh",
         student_random_scores: bool = False,
         student_selection_mode: str = "global",
         student_refresh_interval: int = 1,
@@ -144,9 +146,12 @@ class LLaDA(TemplateLM):
         self.student_prompt_dynamic_kv = self._coerce_bool(student_prompt_dynamic_kv)
         self.student_prompt_layer_split = self._coerce_bool(student_prompt_layer_split)
         self.student_prompt_drift_refresh = self._coerce_bool(student_prompt_drift_refresh)
+        # MaskKV's budget split with our ranking: needs the student loaded but no
+        # student_prompt_* generation mode.
+        self.maskkv_student_scores = self._coerce_bool(maskkv_student_scores)
         self.student_drift_mode = str(student_drift_mode)
-        if self.student_drift_mode not in {"oracle", "student"}:
-            raise RuntimeError("student_drift_mode must be 'oracle' or 'student'")
+        if self.student_drift_mode not in {"oracle", "student", "random"}:
+            raise RuntimeError("student_drift_mode must be 'oracle', 'student' or 'random'")
         self.student_drift_ckpt = student_drift_ckpt
         # Drift says the shallow layers barely move, so refreshing them is wasted work.
         self.student_drift_frozen_layers = int(student_drift_frozen_layers)
@@ -175,6 +180,11 @@ class LLaDA(TemplateLM):
         self.student_full_refresh_interval = int(student_full_refresh_interval)
         if self.student_full_refresh_interval < 0:
             raise RuntimeError("student_full_refresh_interval must be non-negative")
+        # "refresh" ranks by error accumulated since a position was last written;
+        # "step" ranks by how fast it is moving right now.
+        self.student_measured_baseline = str(student_measured_baseline).strip().lower()
+        if self.student_measured_baseline not in {"refresh", "step"}:
+            raise RuntimeError("student_measured_baseline must be 'refresh' or 'step'")
         # Control: keep the same budget but choose the kept positions at random, to
         # separate "this selector is wrong" from "dropping tokens is wrong".
         self.student_random_scores = self._coerce_bool(student_random_scores)
@@ -430,6 +440,7 @@ class LLaDA(TemplateLM):
             or self.student_prompt_dynamic_kv
             or self.student_prompt_layer_split
             or self.student_prompt_drift_refresh
+            or self.maskkv_student_scores
         ):
             if self.student_path is None:
                 raise RuntimeError("student prompt compression requires student_path")
@@ -615,6 +626,7 @@ class LLaDA(TemplateLM):
             ),
             measured_tokens=self.student_measured_tokens,
             full_refresh_interval=self.student_full_refresh_interval,
+            measured_baseline=self.student_measured_baseline,
         )
         return generate_with_layer_split_prompt_kv(
             input_ids=input_ids,
@@ -1254,6 +1266,14 @@ class LLaDA(TemplateLM):
                 left_truncate_len=left_truncate_len,
                 truncation_strategy=self.truncation_strategy,
             )
+            if self.maskkv_student_scores:
+                # MaskKV keeps its layer/head budget split; only the ranking it selects
+                # with becomes the student's importance prediction. The scoring forward
+                # runs through the cache hooks, so the cache has to be initialised first;
+                # generate() resets it again, and the scores survive that reset.
+                feature_cache = dLLMCache()
+                feature_cache.reset_cache(int(context_enc.shape[1]))
+                feature_cache.set_prompt_scores(self._predict_student_scores(context_enc))
             if self.student_prompt_pool_active:
                 out = self._generate_with_student_prompt_pool_active(context_enc, gen_kwargs)
             elif self.student_prompt_drift_refresh:

@@ -234,6 +234,7 @@ def extract_one(
         "teacher_kind": "future_temporal_union_pool",
         "teacher_formula": (
             "mask_union_t top_active_k(sum_committed_suffix_attention_t); "
+            "future_step_masks_t stores each denoising-step top_active_k; "
             "future_frequency_i=count_t(i in top_active_k)/active_update_steps"
         ),
         "teacher_graph": "full_sequence_prompt_suffix",
@@ -250,6 +251,8 @@ def extract_one(
         "question_token_indices": example.question_indices,
         "teacher_raw": result.teacher_raw.to(torch.float16),
         "teacher_norm": result.teacher_norm.to(torch.float16),
+        "future_step_masks": result.future_step_masks,
+        "future_step_count": int(result.future_step_masks.shape[0]),
         "future_frequency": result.future_frequency.to(torch.float16),
         "future_frequency_count": result.future_frequency_count,
         "future_union_mask": result.union_mask,
