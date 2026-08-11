@@ -94,8 +94,20 @@ def select_delta_student_topk(
     prompt_length: int,
     question_window: int,
     refresh_tokens: int,
+    age: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Re-score the current served prompt state and return one global refresh set."""
+    """Re-score the current served prompt state and return one global refresh set.
+
+    `age` (steps since each kept token was last refreshed) turns the student's static
+    rate into a staleness: score = rate x (age + 1). Without it the ranking is
+    self-reinforcing -- an unrefreshed token keeps its hidden state, so it keeps its
+    score, so it keeps losing -- which is how a "dynamic" selector ends up freezing
+    half the kept set forever (measured: 452/960 never refreshed across 128 steps).
+    With it, a losing token's score grows linearly until it must win a slot, so
+    rotation is structural rather than hoped-for. The delta teacher only supplies the
+    per-token rate (its score is a trajectory total, ~ mean movement per step); the
+    time axis has to come from the serving loop, and `age` is exactly that.
+    """
     if not hidden:
         raise RuntimeError("delta student refresh needs cached prompt hidden states")
     keep_count = int(keep_positions.numel())
@@ -119,6 +131,8 @@ def select_delta_student_topk(
         )
         probabilities.append(torch.softmax(scores.float(), dim=-1).squeeze(0))
     pooled = torch.stack(probabilities).mean(dim=0)
+    if age is not None:
+        pooled = pooled * (age.float() + 1.0)
     return torch.topk(pooled, k=refresh_tokens, largest=True).indices.sort().values
 
 
@@ -299,6 +313,8 @@ def generate_with_drift_refresh(
     delta_student: nn.Module | None = None,
     frozen_layers: int = 0,
     question_window: int = 128,
+    refresh_interval: int = 1,
+    delta_select_once: bool = False,
     steps: int = 128,
     gen_length: int = 128,
     block_length: int = 32,
@@ -309,6 +325,8 @@ def generate_with_drift_refresh(
 ) -> torch.Tensor:
     if cfg_scale and float(cfg_scale) > 0.0:
         raise RuntimeError("drift refresh generation does not support cfg_scale")
+    if refresh_interval <= 0:
+        raise RuntimeError("refresh_interval must be positive")
     if mode not in {"oracle", "student", "random", "delta_student"}:
         raise RuntimeError(f"unsupported drift refresh mode: {mode}")
     if mode == "student" and refresh_student is None:
@@ -357,6 +375,7 @@ def generate_with_drift_refresh(
     steps_per_block = steps // num_blocks
 
     gstep = 0
+    frozen_delta_due = None
     previous_due_mask = None
     due_jaccard_sum = 0.0
     due_comparisons = 0
@@ -372,6 +391,19 @@ def generate_with_drift_refresh(
             k_commit = int(ntt[0, si].item())
 
             if hidden is not None:
+                if gstep % refresh_interval != 0:
+                    # Off-cycle step: serve the cache untouched and forward only the
+                    # suffix. Ages still advance so the age-weighted selector sees the
+                    # true time since each token's last refresh when the cycle comes.
+                    logits = _selective_forward(
+                        model, suffix_ids, suffix_positions, served_k, served_v
+                    )
+                    age += 1
+                    x, gstep = _commit(
+                        x, P, logits, nb, block_length, k_commit, temperature,
+                        remasking, mask_id, gstep,
+                    )
+                    continue
                 # cheap path: no shadow forward, only R tokens recomputed
                 c_t = None
                 if refresh_student is not None:
@@ -380,14 +412,25 @@ def generate_with_drift_refresh(
                            if committed.any() else q_all[0])
                 due_indices = None
                 if mode == "delta_student":
-                    due_indices = select_delta_student_topk(
-                        delta_student,
-                        hidden,
-                        keep_positions,
-                        prompt_length=P,
-                        question_window=question_window,
-                        refresh_tokens=R,
-                    )
+                    if delta_select_once and frozen_delta_due is not None:
+                        # The set chosen at the first refresh step, held for the whole
+                        # generation: measures what per-step re-selection actually buys
+                        # over the delta student's prefill-time verdict.
+                        due_indices = frozen_delta_due
+                    else:
+                        due_indices = select_delta_student_topk(
+                            delta_student,
+                            hidden,
+                            keep_positions,
+                            prompt_length=P,
+                            question_window=question_window,
+                            refresh_tokens=R,
+                            # One global due set means every layer's age row is identical,
+                            # so row 0 carries the shared steps-since-refresh.
+                            age=age[0],
+                        )
+                        if delta_select_once:
+                            frozen_delta_due = due_indices
                     due_mask = torch.zeros_like(ever_due)
                     due_mask[due_indices] = True
                     ever_due |= due_mask

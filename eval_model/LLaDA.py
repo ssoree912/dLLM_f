@@ -108,6 +108,7 @@ class LLaDA(TemplateLM):
         student_prompt_drift_refresh: bool = False,
         maskkv_student_scores: bool = False,
         student_drift_mode: str = "oracle",
+        student_delta_select_once: bool = False,
         student_drift_ckpt: Optional[str] = None,
         student_drift_frozen_layers: int = 0,
         student_frozen_layers: int = 16,
@@ -150,6 +151,9 @@ class LLaDA(TemplateLM):
         # student_prompt_* generation mode.
         self.maskkv_student_scores = self._coerce_bool(maskkv_student_scores)
         self.student_drift_mode = str(student_drift_mode)
+        # delta_student mode only: freeze the refresh set at the first selection
+        # instead of re-ranking every step.
+        self.student_delta_select_once = self._coerce_bool(student_delta_select_once)
         if self.student_drift_mode not in {"oracle", "student", "random", "delta_student"}:
             raise RuntimeError(
                 "student_drift_mode must be 'oracle', 'student', 'random' or 'delta_student'"
@@ -701,6 +705,8 @@ class LLaDA(TemplateLM):
             delta_student=self.refresh_student,
             frozen_layers=self.student_drift_frozen_layers,
             question_window=self.student_question_window,
+            refresh_interval=self.student_refresh_interval,
+            delta_select_once=self.student_delta_select_once,
             steps=int(gen_kwargs.get("steps")),
             gen_length=int(gen_kwargs.get("gen_length")),
             block_length=int(gen_kwargs.get("block_length")),
