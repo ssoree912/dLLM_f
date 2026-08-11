@@ -1,0 +1,201 @@
+# /// script
+# requires-python = ">=3.10"
+# dependencies = ["torch", "transformers"]
+# ///
+
+"""Extract reference+delta teacher shards re-using prompts from existing teacher shards.
+
+The 11-dataset keep teacher (future_pool_teacher_train_300each_g128_top128) was
+extracted on a machine whose source jsonl files are not available here, but every
+shard carries `prompt_input_ids`. Since the hybrid extractor only needs prompt
+tokens, reading them from those shards gives the delta signal for all datasets
+without the source data -- and, more importantly, on *exactly* the prompts the keep
+student was trained on, so the keep and delta students share one training
+distribution (the samsum-only delta student was trained on chat-templated
+eval-fewshot prompts instead, a mismatch this path removes).
+
+Output shards follow extract_offline_hybrid_teacher.py's schema (teacher_raw /
+teacher_norm / ref_union_mask / delta_raw / delta_norm / delta_step_max).
+"""
+
+from __future__ import annotations
+
+import argparse
+import time
+from collections.abc import Sequence
+from dataclasses import dataclass
+from pathlib import Path
+
+import torch
+
+from dllm_cache.budget.extract_teacher import load_model_and_tokenizer, parse_dtype
+from dllm_cache.budget.offline_hybrid_teacher import (
+    OfflineHybridTeacherConfig,
+    generate_with_offline_hybrid_teacher,
+)
+
+
+@dataclass(frozen=True, slots=True)
+class ExtractFromShardsConfig:
+    model_path: Path
+    source_root: Path
+    output_root: Path
+    datasets: tuple[str, ...]
+    n_samples: int
+    device: str
+    dtype: torch.dtype
+    gen_length: int
+    block_length: int
+    steps: int
+    active_top_k: int
+    temperature: float
+    confidence_weight: bool
+    target_aggregation: str
+
+
+def parse_args(argv: Sequence[str] | None = None) -> ExtractFromShardsConfig:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--model", type=Path, required=True)
+    parser.add_argument("--source-root", type=Path, required=True,
+                        help="existing teacher root whose shards supply prompt_input_ids")
+    parser.add_argument("--output-root", type=Path, required=True)
+    parser.add_argument("--datasets", nargs="+", default=None,
+                        help="dataset subdirectories to process; default: all")
+    parser.add_argument("--n-samples", type=int, default=0, help="per dataset; 0 = all")
+    parser.add_argument("--device", default="cuda:0")
+    parser.add_argument("--dtype", choices=["bfloat16", "float16", "float32"], default="bfloat16")
+    parser.add_argument("--gen-length", type=int, default=128)
+    parser.add_argument("--block-length", type=int, default=8)
+    parser.add_argument("--steps", type=int, default=128)
+    parser.add_argument("--active-top-k", type=int, default=128)
+    parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument("--confidence-weight", action="store_true")
+    parser.add_argument("--target-aggregation", choices=["max", "sum"], default="max")
+    args = parser.parse_args(argv)
+    return ExtractFromShardsConfig(
+        model_path=args.model,
+        source_root=args.source_root,
+        output_root=args.output_root,
+        datasets=tuple(args.datasets) if args.datasets else (),
+        n_samples=args.n_samples,
+        device=args.device,
+        dtype=parse_dtype(args.dtype),
+        gen_length=args.gen_length,
+        block_length=args.block_length,
+        steps=args.steps,
+        active_top_k=args.active_top_k,
+        temperature=args.temperature,
+        confidence_weight=args.confidence_weight,
+        target_aggregation=args.target_aggregation,
+    )
+
+
+def list_source_files(config: ExtractFromShardsConfig) -> list[Path]:
+    if not config.source_root.is_dir():
+        raise RuntimeError(f"source root is not a directory: {config.source_root}")
+    files: list[Path] = []
+    for dataset_dir in sorted(p for p in config.source_root.iterdir() if p.is_dir()):
+        if config.datasets and dataset_dir.name not in config.datasets:
+            continue
+        dataset_files = sorted(dataset_dir.glob("*.pt"))
+        if config.n_samples > 0:
+            dataset_files = dataset_files[: config.n_samples]
+        files.extend(dataset_files)
+    if not files:
+        raise RuntimeError(f"no source shards found under {config.source_root}")
+    return files
+
+
+@torch.inference_mode()
+def extract_one(model: torch.nn.Module, tokenizer, src: dict, config: ExtractFromShardsConfig) -> dict:
+    prompt_tensor = src["prompt_input_ids"].to(torch.long)
+    prompt_ids = prompt_tensor.unsqueeze(0).to(config.device)
+    teacher_config = OfflineHybridTeacherConfig(
+        gen_length=config.gen_length,
+        block_length=config.block_length,
+        steps=config.steps,
+        active_top_k=config.active_top_k,
+        temperature=config.temperature,
+        confidence_weight=config.confidence_weight,
+        target_aggregation=config.target_aggregation,
+    )
+    result = generate_with_offline_hybrid_teacher(model, prompt_ids, teacher_config)
+    generated_answer = tokenizer.batch_decode(
+        result.generated_ids.unsqueeze(0), skip_special_tokens=True
+    )[0].strip()
+    prompt_length = int(prompt_tensor.numel())
+    return {
+        "teacher_kind": "offline_hybrid_ref_delta",
+        "teacher_formula": (
+            f"reference={config.target_aggregation}_step_committed_suffix_to_prompt_attention_"
+            "masked_by_temporal_union_topk; "
+            "delta=sum_t mean(K_relative_stepwise,V_relative_stepwise)"
+        ),
+        "teacher_graph": "full_sequence_prompt_suffix_single_forward_ref_and_delta",
+        "prompt_source": "reused_from_existing_teacher_shard",
+        "sample_id": src["sample_id"],
+        "dataset": src["dataset"],
+        "task": src.get("task", ""),
+        "question": src.get("question", ""),
+        "answers": src.get("answers", ""),
+        "generated_answer": generated_answer,
+        "prompt_input_ids": prompt_tensor,
+        "answer_input_ids": result.generated_ids.to(torch.long),
+        "generated_answer_input_ids": result.generated_ids.to(torch.long),
+        "prompt_token_indices": torch.arange(prompt_length, dtype=torch.long),
+        "question_token_indices": src["question_token_indices"],
+        "teacher_raw": result.teacher_raw.to(torch.float16),
+        "teacher_norm": result.teacher_norm.to(torch.float16),
+        "ref_union_mask": result.ref_union_mask,
+        "ref_union_size_by_layer": result.ref_union_size_by_layer,
+        "ref_union_size_mean": float(result.ref_union_size_by_layer.float().mean().item()),
+        "delta_raw": result.delta_raw.to(torch.float16),
+        "delta_norm": result.delta_norm.to(torch.float16),
+        "delta_step_max": result.delta_step_max.to(torch.float16),
+        "delta_observation_count": result.delta_observation_count,
+        "prompt_length": prompt_length,
+        "generated_length": int(result.generated_ids.numel()),
+        "sequence_length": prompt_length + int(result.generated_ids.numel()),
+        "gen_length": config.gen_length,
+        "block_length": config.block_length,
+        "steps": config.steps,
+        "active_top_k": config.active_top_k,
+        "target_aggregation": config.target_aggregation,
+        "prompt_format": src.get("prompt_format", ""),
+        "apply_chat_template": src.get("apply_chat_template", 0) or 0,
+        "reference_step_count": result.reference_step_count,
+        "commit_count": result.commit_count,
+        "confidence_weight_sum": result.weight_sum,
+        "confidence_weight": int(config.confidence_weight),
+    }
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    config = parse_args(argv)
+    model, tokenizer = load_model_and_tokenizer(config)
+    files = list_source_files(config)
+    started = time.time()
+    saved = 0
+    for index, path in enumerate(files, start=1):
+        out_path = config.output_root / path.relative_to(config.source_root)
+        if out_path.exists():
+            saved += 1
+            continue
+        src = torch.load(path, map_location="cpu", weights_only=False)
+        rec = extract_one(model, tokenizer, src, config)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(rec, out_path)
+        saved += 1
+        print(
+            f"[hybrid-from-shards {index}/{len(files)}] saved={out_path} "
+            f"dataset={rec['dataset']} prompt={rec['prompt_length']} "
+            f"delta_mean={rec['delta_raw'].float().mean().item():.4f} "
+            f"elapsed={time.time() - started:.0f}s",
+            flush=True,
+        )
+    print(f"[done] saved={saved} elapsed={time.time() - started:.1f}s", flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
