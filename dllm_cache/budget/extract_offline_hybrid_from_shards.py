@@ -51,6 +51,9 @@ class ExtractFromShardsConfig:
     temperature: float
     confidence_weight: bool
     target_aggregation: str
+    apply_chat_template: bool
+    max_length: int
+    question_window: int
 
 
 def parse_args(argv: Sequence[str] | None = None) -> ExtractFromShardsConfig:
@@ -71,6 +74,15 @@ def parse_args(argv: Sequence[str] | None = None) -> ExtractFromShardsConfig:
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--confidence-weight", action="store_true")
     parser.add_argument("--target-aggregation", choices=["max", "sum"], default="max")
+    parser.add_argument(
+        "--apply-chat-template",
+        action="store_true",
+        help="decode the stored prompt tokens, wrap them the way the inference harness "
+        "does, and re-encode -- delta is sensitive to the inference-time distribution "
+        "(matched-sample samsum: templated 0.3876 vs template-free 0.3522)",
+    )
+    parser.add_argument("--max-length", type=int, default=2048)
+    parser.add_argument("--question-window", type=int, default=128)
     args = parser.parse_args(argv)
     return ExtractFromShardsConfig(
         model_path=args.model,
@@ -87,6 +99,9 @@ def parse_args(argv: Sequence[str] | None = None) -> ExtractFromShardsConfig:
         temperature=args.temperature,
         confidence_weight=args.confidence_weight,
         target_aggregation=args.target_aggregation,
+        apply_chat_template=args.apply_chat_template,
+        max_length=args.max_length,
+        question_window=args.question_window,
     )
 
 
@@ -106,9 +121,29 @@ def list_source_files(config: ExtractFromShardsConfig) -> list[Path]:
     return files
 
 
+def build_prompt_tensor(tokenizer, src: dict, config: ExtractFromShardsConfig) -> tuple[torch.Tensor, torch.Tensor]:
+    """Prompt tokens (optionally re-wrapped with the chat template) and question indices."""
+    prompt_tensor = src["prompt_input_ids"].to(torch.long)
+    if not config.apply_chat_template:
+        return prompt_tensor, src["question_token_indices"].to(torch.long)
+    text = tokenizer.decode(prompt_tensor, skip_special_tokens=True)
+    templated = tokenizer.apply_chat_template(
+        [{"role": "user", "content": text}],
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+    ids = [int(t) for t in tokenizer(templated, add_special_tokens=False)["input_ids"]]
+    prompt_cap = max(1, config.max_length - config.gen_length)
+    ids = ids[-prompt_cap:]
+    prompt_tensor = torch.tensor(ids, dtype=torch.long)
+    window = min(max(1, config.question_window), len(ids))
+    question_indices = torch.arange(len(ids) - window, len(ids), dtype=torch.long)
+    return prompt_tensor, question_indices
+
+
 @torch.inference_mode()
 def extract_one(model: torch.nn.Module, tokenizer, src: dict, config: ExtractFromShardsConfig) -> dict:
-    prompt_tensor = src["prompt_input_ids"].to(torch.long)
+    prompt_tensor, question_indices = build_prompt_tensor(tokenizer, src, config)
     prompt_ids = prompt_tensor.unsqueeze(0).to(config.device)
     teacher_config = OfflineHybridTeacherConfig(
         gen_length=config.gen_length,
@@ -143,7 +178,7 @@ def extract_one(model: torch.nn.Module, tokenizer, src: dict, config: ExtractFro
         "answer_input_ids": result.generated_ids.to(torch.long),
         "generated_answer_input_ids": result.generated_ids.to(torch.long),
         "prompt_token_indices": torch.arange(prompt_length, dtype=torch.long),
-        "question_token_indices": src["question_token_indices"],
+        "question_token_indices": question_indices,
         "teacher_raw": result.teacher_raw.to(torch.float16),
         "teacher_norm": result.teacher_norm.to(torch.float16),
         "ref_union_mask": result.ref_union_mask,
@@ -162,7 +197,7 @@ def extract_one(model: torch.nn.Module, tokenizer, src: dict, config: ExtractFro
         "active_top_k": config.active_top_k,
         "target_aggregation": config.target_aggregation,
         "prompt_format": src.get("prompt_format", ""),
-        "apply_chat_template": src.get("apply_chat_template", 0) or 0,
+        "apply_chat_template": int(config.apply_chat_template),
         "reference_step_count": result.reference_step_count,
         "commit_count": result.commit_count,
         "confidence_weight_sum": result.weight_sum,
