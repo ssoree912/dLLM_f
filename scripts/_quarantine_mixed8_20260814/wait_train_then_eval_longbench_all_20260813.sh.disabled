@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "${ROOT}"
+
+TRAIN_PID="${TRAIN_PID:-283990}"
+OLD_CHAIN_PID="${OLD_CHAIN_PID:-283980}"
+TRAIN_LOG=results/budget/student_delta_300each_chat_topk480_20260813/run_logs/train.log
+CHECKPOINT=results/budget/student_delta_300each_chat_topk480_20260813/checkpoint-best/pytorch_model.bin
+
+echo "[wait] topk-480 training PID=${TRAIN_PID}"
+while [[ -r "/proc/${TRAIN_PID}/status" ]]; do
+  state="$(awk '/^State:/{print $2}' "/proc/${TRAIN_PID}/status")"
+  [[ "${state}" == "Z" ]] && break
+  sleep 15
+done
+
+# The old parent is deliberately stopped so it cannot launch the superseded
+# SAMSum-limit-100 evaluation. Remove it after its training child finishes.
+if kill -0 "${OLD_CHAIN_PID}" 2>/dev/null; then
+  kill -KILL "${OLD_CHAIN_PID}" 2>/dev/null || true
+fi
+
+if [[ ! -f "${CHECKPOINT}" ]] || ! grep -q '\[epoch 10\] ' "${TRAIN_LOG}"; then
+  echo "[error] topk-480 training did not complete successfully" >&2
+  exit 1
+fi
+
+for _ in $(seq 1 40); do
+  gpu_pids="$(nvidia-smi -i 2 --query-compute-apps=pid --format=csv,noheader,nounits | tr -d '[:space:]')"
+  [[ -z "${gpu_pids}" ]] && break
+  sleep 3
+done
+
+echo "[start] standard English LongBench evaluation (16 datasets, 3,750 rows)"
+exec ./scripts/eval_delta_chat_topk480_longbench_all_20260813.sh
