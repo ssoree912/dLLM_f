@@ -79,6 +79,8 @@ class ReferenceTrace:
                 raw = self.sum_scores
             case _:
                 raise RuntimeError(f"unsupported target aggregation: {target_aggregation}")
+        if self.active_top_k <= 0:
+            return raw
         return raw * self.union_mask.float()
 
 
@@ -395,9 +397,10 @@ def accumulate_reference(
         weights = torch.ones_like(weights, dtype=torch.float32)
     for layer_id, layer_attention in prompt_attention.items():
         scores = (layer_attention.index_select(0, selected).float() * weights.unsqueeze(-1)).sum(dim=0)
-        top_count = min(trace.active_top_k, int(scores.numel()))
-        top_indices = torch.topk(scores, k=top_count, largest=True).indices
-        trace.union_mask[layer_id].scatter_(dim=0, index=top_indices, value=True)
+        if trace.active_top_k > 0:
+            top_count = min(trace.active_top_k, int(scores.numel()))
+            top_indices = torch.topk(scores, k=top_count, largest=True).indices
+            trace.union_mask[layer_id].scatter_(dim=0, index=top_indices, value=True)
         trace.sum_scores[layer_id] += scores
         trace.max_scores[layer_id] = torch.maximum(trace.max_scores[layer_id], scores)
     trace.step_count += 1

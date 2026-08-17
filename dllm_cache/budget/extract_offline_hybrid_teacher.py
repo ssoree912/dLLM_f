@@ -172,13 +172,16 @@ def extract_one(
         skip_special_tokens=True,
     )[0].strip()
     prompt_tensor = torch.tensor(example.prompt_ids, dtype=torch.long)
+    reference_formula = (
+        f"reference={config.target_aggregation}_step_committed_suffix_to_prompt_attention_dense_all_prompt; "
+        if config.active_top_k <= 0
+        else f"reference={config.target_aggregation}_step_committed_suffix_to_prompt_attention_"
+        "masked_by_temporal_union_topk; "
+    )
     return {
         "teacher_kind": "offline_hybrid_ref_delta",
-        "teacher_formula": (
-            f"reference={config.target_aggregation}_step_committed_suffix_to_prompt_attention_"
-            "masked_by_temporal_union_topk; "
-            "delta=sum_t mean(K_relative_stepwise,V_relative_stepwise)"
-        ),
+        "teacher_formula": reference_formula
+        + "delta=sum_t mean(K_relative_stepwise,V_relative_stepwise)",
         "teacher_graph": "full_sequence_prompt_suffix_single_forward_ref_and_delta",
         "sample_id": sample.sample_id,
         "dataset": sample.dataset,
