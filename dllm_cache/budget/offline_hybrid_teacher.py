@@ -22,7 +22,7 @@ from dllm_cache.budget.full_dynamic_trajectory_teacher import (
     build_transfer_index,
     select_candidates,
 )
-from dllm_cache.budget.future_pool_teacher import normalize_scores, validate_generation_shape
+from dllm_cache.budget.future_pool_teacher import normalize_scores
 from dllm_cache.budget.prompt_kv_cache import project_heads, repeat_heads
 from utils.generate_function import get_num_transfer_tokens
 
@@ -39,6 +39,7 @@ class OfflineHybridTeacherConfig:
     temperature: float
     confidence_weight: bool
     target_aggregation: str
+    reference_query_mode: str = "commit"
     mask_id: int = MASK_ID
 
 
@@ -60,7 +61,12 @@ class OfflineHybridTeacherResult:
 
 @dataclass(slots=True)
 class ReferenceTrace:
-    """Running reference score and temporal-union state."""
+    """Running reference score and optional temporal-union state.
+
+    ``active_top_k == 0`` means that no teacher-side support budget is applied:
+    every prompt position remains in the support and the continuous aggregate is
+    normalized directly.
+    """
 
     sum_scores: torch.Tensor
     max_scores: torch.Tensor
@@ -295,7 +301,12 @@ def generate_with_offline_hybrid_teacher(
     trace = ReferenceTrace(
         sum_scores=torch.zeros((layer_count, prompt_length), device=prompt_ids.device),
         max_scores=torch.zeros((layer_count, prompt_length), device=prompt_ids.device),
-        union_mask=torch.zeros((layer_count, prompt_length), dtype=torch.bool, device=prompt_ids.device),
+        union_mask=torch.full(
+            (layer_count, prompt_length),
+            fill_value=config.active_top_k == 0,
+            dtype=torch.bool,
+            device=prompt_ids.device,
+        ),
         confidence_weight=config.confidence_weight,
         active_top_k=config.active_top_k,
     )
@@ -328,7 +339,22 @@ def generate_with_offline_hybrid_teacher(
                 x0, confidence = select_candidates(logits, suffix_ids, mask_index, candidate_config)
                 confidence[:, end:] = -torch.inf
                 transfer_index = build_transfer_index(confidence, transfer_counts[:, step_id])
-                accumulate_reference(trace, prompt_attention, transfer_index, confidence)
+                if config.reference_query_mode == "commit":
+                    reference_index = transfer_index
+                else:
+                    # A generation position enters its lifetime when its block becomes
+                    # active and contributes at every step until it is committed. Future
+                    # blocks are deliberately excluded so a position is not rewarded
+                    # merely for waiting while an earlier block is decoded.
+                    reference_index = torch.zeros_like(mask_index)
+                    reference_index[:, start:end] = mask_index[:, start:end]
+                accumulate_reference(
+                    trace,
+                    prompt_attention,
+                    reference_index,
+                    confidence,
+                    committed_count=int(transfer_index.sum().item()),
+                )
                 suffix_ids[transfer_index] = x0[transfer_index]
     finally:
         collector.restore()
@@ -353,9 +379,19 @@ def generate_with_offline_hybrid_teacher(
 
 
 def validate_offline_hybrid_config(config: OfflineHybridTeacherConfig) -> None:
-    validate_generation_shape(config)
+    if config.gen_length % config.block_length != 0:
+        raise RuntimeError("gen_length must be divisible by block_length")
+    num_blocks = config.gen_length // config.block_length
+    if config.steps % num_blocks != 0:
+        raise RuntimeError("steps must be divisible by number of blocks")
+    if config.active_top_k < 0:
+        raise RuntimeError("active_top_k must be non-negative; zero disables teacher-side top-k")
     if config.target_aggregation not in {"max", "sum"}:
         raise RuntimeError(f"unsupported target aggregation: {config.target_aggregation}")
+    if config.reference_query_mode not in {"commit", "lifetime_mask"}:
+        raise RuntimeError(
+            f"unsupported reference query mode: {config.reference_query_mode}"
+        )
 
 
 def full_sequence_logits_and_signals(
@@ -380,14 +416,16 @@ def full_sequence_logits_and_signals(
 def accumulate_reference(
     trace: ReferenceTrace,
     prompt_attention: dict[int, torch.Tensor],
-    transfer_index: torch.Tensor,
+    reference_index: torch.Tensor,
     confidence: torch.Tensor,
+    *,
+    committed_count: int | None = None,
 ) -> None:
     """Match ``future_pool_teacher.accumulate_future_pool`` without step tensors."""
 
-    if transfer_index.shape[0] != 1:
+    if reference_index.shape[0] != 1:
         raise RuntimeError("offline hybrid teacher expects batch size 1")
-    selected = transfer_index[0].nonzero(as_tuple=False).flatten()
+    selected = reference_index[0].nonzero(as_tuple=False).flatten()
     if selected.numel() == 0:
         return
     weights = confidence[0].index_select(0, selected).clamp_min(0.0).float()
@@ -395,13 +433,14 @@ def accumulate_reference(
         weights = torch.ones_like(weights, dtype=torch.float32)
     for layer_id, layer_attention in prompt_attention.items():
         scores = (layer_attention.index_select(0, selected).float() * weights.unsqueeze(-1)).sum(dim=0)
-        top_count = min(trace.active_top_k, int(scores.numel()))
-        top_indices = torch.topk(scores, k=top_count, largest=True).indices
-        trace.union_mask[layer_id].scatter_(dim=0, index=top_indices, value=True)
+        if trace.active_top_k > 0:
+            top_count = min(trace.active_top_k, int(scores.numel()))
+            top_indices = torch.topk(scores, k=top_count, largest=True).indices
+            trace.union_mask[layer_id].scatter_(dim=0, index=top_indices, value=True)
         trace.sum_scores[layer_id] += scores
         trace.max_scores[layer_id] = torch.maximum(trace.max_scores[layer_id], scores)
     trace.step_count += 1
-    trace.commit_count += int(selected.numel())
+    trace.commit_count += int(selected.numel()) if committed_count is None else committed_count
     trace.weight_sum += float(weights.sum().detach().cpu())
 
 
