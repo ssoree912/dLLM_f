@@ -228,3 +228,62 @@ Eval task name은 `TASK_ROOT/<task>.yaml`의 `task:` 필드를 읽어서 사용�
 | `longbench16_attention_rank_delta_rank_b960_r480_chat_except_trec_20260817/narrativeqa` | same | same | chat | 200 | 0.1602 ± 0.0217 |
 
 이 값들은 category-500 학습 전의 baseline/ablation 결과다. Category별 500개 teacher + 20epoch 학습이 끝나면 이 문서의 성능 표를 새 결과로 갱신한다.
+
+## 8. 2026-08-18 dense scorer SAMSum ablation
+
+SAMSum 300개 teacher로 `attention_delta` 2-head scorer를 학습했다. 공통 추론 설정은 다음과 같다.
+
+```text
+eval task: longbench_samsum
+eval samples: 200
+eval prompt: chat template 적용
+student_budget: 960
+student_refresh_tokens: 480
+student_drift_mode: delta_student
+student_delta_select_once: True
+student_refresh_interval: 1
+student_score_activation: softmax
+block_length: 32
+gen_length: 128
+steps: 128
+```
+
+Dense scorer teacher는 `active_top_k=0`으로 attention teacher support를 자르지 않는다. 즉 `teacher_norm`은 모든 prompt token에 대한 continuous score이고, budget은 inference에서만 적용한다. Delta는 같은 trajectory에서 모든 prompt token의 cumulative K/V movement를 저장한 `delta_norm`이다.
+
+| run | teacher chat | confidence | target | attention/delta source | score |
+|---|---:|---:|---|---|---:|
+| `samsum300_dense_chat_2head_b960_r480_once_20260818` | 1 | 1 | `attention_delta` | chat attention + chat delta | `0.3412 ± 0.0133` |
+| `samsum300_dense_nochat_attention_delta_2head_b960_r480_once_20260818` | 0 | 1 | `attention_delta` | no-chat attention + no-chat delta | `0.3628 ± 0.0132` |
+| `samsum300_dense_nochat_conf0_attention_delta_2head_b960_r480_once_20260818` | 0 | 0 | `attention_delta` | no-chat attention + no-chat delta | `0.3502` |
+
+Artifact paths:
+
+| artifact | path |
+|---|---|
+| dense chat conf=1 teacher | `/home/M2026107/.cache/dlpc_kv_pruning_teacher_samsum300_dense_chat_20260818` |
+| dense chat conf=1 2-head student | `results/budget/dlpc_kv_pruning_samsum300_dense_chat_20260818/attention_delta_2head_rank0p1_topk0_e20/checkpoint-best` |
+| dense no-chat conf=1 teacher | `/home/M2026107/.cache/offline_hybrid_teacher_samsum300_dense_nochat_20260818` |
+| dense no-chat conf=1 2-head student | `results/budget/student_samsum300_dense_nochat_attention_delta_2head_rank0p1_topk0_e20_20260818/checkpoint-best` |
+| dense no-chat conf=0 teacher | `/home/M2026107/.cache/offline_hybrid_teacher_samsum300_dense_nochat_conf0_20260818` |
+| dense no-chat conf=0 2-head student | `results/budget/student_samsum300_dense_nochat_conf0_attention_delta_2head_rank0p1_topk0_e20_20260818/checkpoint-best` |
+
+Interpretation:
+
+- Dense continuous scorer 기준에서는 `teacher chat template = 0`, `confidence_weight = 1`이 현재 SAMSum best다.
+- `0.3628` 결과는 attention과 delta가 둘 다 no-chat이다. 같은 2-head checkpoint를 `student_path`와 `student_refresh_path`에 넣었고, 해당 checkpoint의 teacher root는 `apply_chat_template=0`, `confidence_weight=1`, `active_top_k=0` shard다.
+- `0.3412` 결과는 attention과 delta가 둘 다 chat이다.
+- Dense 2-head 결과만 놓고 보면 chat-template teacher가 일관되게 좋은 것은 아니다. 반대로 no-chat teacher가 더 좋았다.
+- 그러나 Top-128 teacher 결과에서는 chat/confidence 조합이 더 좋은 기록이 있었으므로, template 효과는 `active_top_k=128` teacher sparsification과 상호작용한다. 따라서 interval 효과와 template/support 효과는 분리해서 봐야 한다.
+- 연구 목적상 main method는 dense scorer가 더 깔끔하다. Teacher는 budget-free continuous score를 만들고, keep/refresh budget은 inference-time hyperparameter로만 적용되기 때문이다. Top-128 teacher는 stronger heuristic/teacher-sparsification ablation으로 남기는 것이 적절하다.
+
+현재 진행 중인 확장 추출:
+
+```text
+script: scripts/run_dense_nochat_conf1_teacher_300each_rest_20260818.sh
+output_root: /home/M2026107/.cache/offline_hybrid_teacher_300each_dense_nochat_conf1_20260818
+datasets: 2wikimultihopqa_train, gov_report, hotpotqa, multi_news, musique,
+          narrativeqa, qasper, qmsum, trec, triviaqa
+setting: no-chat, confidence_weight=1, active_top_k=0, n_samples=300
+```
+
+SAMSum은 이미 `/home/M2026107/.cache/offline_hybrid_teacher_samsum300_dense_nochat_20260818`에 같은 설정으로 추출되어 있다.

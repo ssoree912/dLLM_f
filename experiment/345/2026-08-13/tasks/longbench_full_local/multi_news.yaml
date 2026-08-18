@@ -3,9 +3,11 @@ tag:
   - longbench_summarization_tasks
   - longbench_tasks
 task: longbench_multi_news
-dataset_path: /workspace/dllm/data/eval/longbench
+dataset_path: json
+dataset_kwargs:
+  data_files:
+    test: /home/M2026107/dllm/data/longbench/multi_news.jsonl
 test_split: test
-dataset_name: multi_news
 doc_to_text: "You are given several news passages. Write a one-page summary of all news. \n\nNews:\n{{context}}\n\nNow, write a one-page summary of all the news.\n\nSummary:"
 doc_to_target: '{{answers}}'
 process_results: !function metrics.get_rouge_with_score

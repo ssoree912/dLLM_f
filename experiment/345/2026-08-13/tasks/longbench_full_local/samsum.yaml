@@ -3,10 +3,12 @@ tag:
   - longbench_fewshot_tasks
   - longbench_tasks
 task: longbench_samsum
-dataset_path: /workspace/dllm/data/eval/longbench
+dataset_path: json
+dataset_kwargs:
+  data_files:
+    test: /home/M2026107/dllm/data/longbench/samsum.jsonl
 test_split: test
-dataset_name: samsum
-doc_to_text: "Summarize the dialogue into a few short sentences. The following are some examples.\n\n{{context}}\n{{question}}"
+doc_to_text: "Summarize the dialogue into a few short sentences. The following are some examples.\n\n{{context}}\n{{input}}"
 doc_to_target: '{{answers}}'
 target_delimiter: ""
 process_results: !function metrics.get_rouge_with_score
