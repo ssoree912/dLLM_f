@@ -15,24 +15,36 @@ class StudentConfig:
     hidden_dim: int = 4096
     proj_dim: int = 256
     mlp_dim: int = 512
+    heads: tuple[str, ...] = ("score",)
 
 
 class PromptUtilityStudentLayer(nn.Module):
     def __init__(self, config: StudentConfig) -> None:
         super().__init__()
+        self.heads = normalize_heads(config.heads)
         self.token_proj = nn.Linear(config.hidden_dim, config.proj_dim)
         self.question_proj = nn.Linear(config.hidden_dim, config.proj_dim)
-        self.score_head = nn.Sequential(
-            nn.Linear(config.proj_dim * 3, config.mlp_dim),
-            nn.GELU(),
-            nn.Linear(config.mlp_dim, 1),
-        )
+        if self.heads == ("score",):
+            self.score_head = build_score_head(config)
+        else:
+            self.score_heads = nn.ModuleDict(
+                {head: build_score_head(config) for head in self.heads}
+            )
+
+    def select_head(self, head: str | None) -> nn.Module:
+        if hasattr(self, "score_heads"):
+            selected = head or self.heads[0]
+            if selected not in self.score_heads:
+                raise RuntimeError(f"student head {selected!r} not found in {self.heads}")
+            return self.score_heads[selected]
+        return self.score_head
 
     def forward(
         self,
         hidden_states: torch.Tensor,
         prompt_indices: torch.Tensor,
         question_indices: torch.Tensor,
+        head: str | None = None,
     ) -> torch.Tensor:
         prompt_hidden = hidden_states.index_select(dim=1, index=prompt_indices)
         question_hidden = hidden_states.index_select(dim=1, index=question_indices)
@@ -44,12 +56,41 @@ class PromptUtilityStudentLayer(nn.Module):
             [token_proj, question_proj, token_proj * question_proj],
             dim=-1,
         )
-        return self.score_head(fused).squeeze(-1)
+        return self.select_head(head)(fused).squeeze(-1)
+
+
+def normalize_heads(heads: tuple[str, ...] | list[str] | str) -> tuple[str, ...]:
+    if isinstance(heads, str):
+        normalized = (heads,)
+    else:
+        normalized = tuple(heads)
+    if not normalized:
+        raise RuntimeError("student must define at least one head")
+    if len(set(normalized)) != len(normalized):
+        raise RuntimeError(f"duplicate student heads: {normalized}")
+    return normalized
+
+
+def build_score_head(config: StudentConfig) -> nn.Sequential:
+    return nn.Sequential(
+            nn.Linear(config.proj_dim * 3, config.mlp_dim),
+            nn.GELU(),
+            nn.Linear(config.mlp_dim, 1),
+    )
 
 
 class PromptUtilityStudent(nn.Module):
     def __init__(self, config: StudentConfig) -> None:
         super().__init__()
+        heads = normalize_heads(config.heads)
+        if heads != config.heads:
+            config = StudentConfig(
+                layer_count=config.layer_count,
+                hidden_dim=config.hidden_dim,
+                proj_dim=config.proj_dim,
+                mlp_dim=config.mlp_dim,
+                heads=heads,
+            )
         self.config = config
         self.layer_indices = tuple(range(config.layer_count))
         self.layers = nn.ModuleDict(
@@ -65,8 +106,14 @@ class PromptUtilityStudent(nn.Module):
         hidden_states: torch.Tensor,
         prompt_indices: torch.Tensor,
         question_indices: torch.Tensor,
+        head: str | None = None,
     ) -> torch.Tensor:
-        return self.layers[str(layer_id)](hidden_states, prompt_indices, question_indices)
+        return self.layers[str(layer_id)](
+            hidden_states,
+            prompt_indices,
+            question_indices,
+            head=head,
+        )
 
     def save_pretrained(self, output_dir: Path) -> None:
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -75,6 +122,7 @@ class PromptUtilityStudent(nn.Module):
             "hidden_dim": self.config.hidden_dim,
             "proj_dim": self.config.proj_dim,
             "mlp_dim": self.config.mlp_dim,
+            "heads": list(normalize_heads(self.config.heads)),
         }
         (output_dir / "config.json").write_text(json.dumps(config, indent=2))
         torch.save(self.state_dict(), output_dir / "pytorch_model.bin")

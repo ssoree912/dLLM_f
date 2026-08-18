@@ -122,12 +122,15 @@ def select_delta_student_topk(
         question_indices = prompt_indices[-1:]
 
     probabilities = []
+    heads = tuple(getattr(getattr(student, "config", None), "heads", ("score",)))
+    selected_head = "delta" if "delta" in heads else None
     for layer_id, layer_hidden in enumerate(hidden):
         scores = student.forward_layer(
             layer_id,
             layer_hidden.float(),
             prompt_indices,
             question_indices,
+            head=selected_head,
         )
         probabilities.append(torch.softmax(scores.float(), dim=-1).squeeze(0))
     pooled = torch.stack(probabilities).mean(dim=0)

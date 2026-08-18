@@ -526,8 +526,18 @@ class LLaDA(TemplateLM):
             )
         return student
 
+    @staticmethod
+    def _student_supports_head(student, head: str) -> bool:
+        heads = tuple(getattr(getattr(student, "config", None), "heads", ("score",)))
+        return head in heads
+
     @torch.inference_mode()
-    def _predict_student_scores(self, input_ids: torch.Tensor, student=None) -> torch.Tensor:
+    def _predict_student_scores(
+        self,
+        input_ids: torch.Tensor,
+        student=None,
+        head: str | None = None,
+    ) -> torch.Tensor:
         student = self.student if student is None else student
         if student is None:
             raise RuntimeError("student model is not loaded")
@@ -555,12 +565,14 @@ class LLaDA(TemplateLM):
             device=input_ids.device,
         )
         scores = []
+        selected_head = head if head is not None and self._student_supports_head(student, head) else None
         for layer_id in student.layer_indices:
             layer_scores = student.forward_layer(
                 layer_id,
                 out.hidden_states[layer_id].float(),
                 prompt_indices,
                 question_indices,
+                head=selected_head,
             )
             layer_scores = layer_scores.float()
             match self.student_score_activation:
@@ -580,7 +592,7 @@ class LLaDA(TemplateLM):
         from dllm_cache.budget.prompt_kv_cache import build_prompt_kv_cache
         from dllm_cache.budget.prompt_kv_generate import generate_with_prompt_kv
 
-        student_scores = self._predict_student_scores(input_ids)
+        student_scores = self._predict_student_scores(input_ids, head="attention")
         prompt_cache = build_prompt_kv_cache(
             self.model,
             input_ids,
@@ -614,7 +626,7 @@ class LLaDA(TemplateLM):
             generate_with_layer_split_prompt_kv,
         )
 
-        student_scores = self._predict_student_scores(input_ids)
+        student_scores = self._predict_student_scores(input_ids, head="attention")
         prompt_cache = build_layer_split_prompt_cache(
             self.model,
             input_ids,
@@ -625,7 +637,7 @@ class LLaDA(TemplateLM):
             refresh_scores=(
                 None
                 if self.refresh_student is None
-                else self._predict_student_scores(input_ids, self.refresh_student)
+                else self._predict_student_scores(input_ids, self.refresh_student, head="delta")
             ),
             rotate_steps=(
                 int(gen_kwargs.get("steps")) if self.student_refresh_rotate else 0
@@ -659,7 +671,7 @@ class LLaDA(TemplateLM):
             generate_with_dynamic_prompt_kv,
         )
 
-        student_scores = self._predict_student_scores(input_ids)
+        student_scores = self._predict_student_scores(input_ids, head="attention")
         prompt_cache = build_dynamic_prompt_kv_cache(
             self.model,
             input_ids,
@@ -691,7 +703,7 @@ class LLaDA(TemplateLM):
         """
         from dllm_cache.budget.drift_refresh_kv import generate_with_drift_refresh
 
-        scores = self._predict_student_scores(input_ids)
+        scores = self._predict_student_scores(input_ids, head="attention")
         budget = min(self.student_budget, int(input_ids.shape[1]))
         keep = torch.topk(scores.mean(dim=0), k=budget, largest=True).indices.sort().values
         refresh_tokens = self.student_refresh_tokens or max(1, budget // 4)
@@ -720,7 +732,7 @@ class LLaDA(TemplateLM):
     def _generate_with_student_prompt_prune(self, input_ids: torch.Tensor, gen_kwargs: dict) -> torch.Tensor:
         from dllm_cache.budget.oracle_prune import install_oracle_pruner
 
-        student_scores = self._predict_student_scores(input_ids)
+        student_scores = self._predict_student_scores(input_ids, head="attention")
         controller = install_oracle_pruner(
             self.model,
             prompt_length=int(input_ids.shape[1]),
@@ -757,7 +769,7 @@ class LLaDA(TemplateLM):
         cfg_scale = float(gen_kwargs.get("cfg_scale", 0.0) or 0.0)
         if cfg_scale != 0.0:
             raise RuntimeError("student prompt pool-active generation does not support cfg_scale")
-        student_scores = self._predict_student_scores(input_ids)
+        student_scores = self._predict_student_scores(input_ids, head="attention")
         prompt_cache = build_pool_active_prompt_kv_cache(
             self.model,
             input_ids,
@@ -1284,7 +1296,7 @@ class LLaDA(TemplateLM):
                 # generate() resets it again, and the scores survive that reset.
                 feature_cache = dLLMCache()
                 feature_cache.reset_cache(int(context_enc.shape[1]))
-                feature_cache.set_prompt_scores(self._predict_student_scores(context_enc))
+                feature_cache.set_prompt_scores(self._predict_student_scores(context_enc, head="attention"))
             if self.student_prompt_pool_active:
                 out = self._generate_with_student_prompt_pool_active(context_enc, gen_kwargs)
             elif self.student_prompt_drift_refresh:
