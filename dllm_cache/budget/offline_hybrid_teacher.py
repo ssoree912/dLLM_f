@@ -32,13 +32,20 @@ MASK_ID = 126336
 
 @dataclass(frozen=True, slots=True)
 class OfflineHybridTeacherConfig:
-    gen_length: int
-    block_length: int
-    steps: int
-    active_top_k: int
-    temperature: float
-    confidence_weight: bool
-    target_aggregation: str
+    """Attention+Delta teacher defaults used by the prune-cache scorer.
+
+    The primary path is dense, confidence weighted, max aggregated, and does
+    not apply chat formatting.  Legacy callers may still override these fields
+    while old experiments are being migrated.
+    """
+
+    gen_length: int = 128
+    block_length: int = 8
+    steps: int = 128
+    active_top_k: int = 0
+    temperature: float = 0.0
+    confidence_weight: bool = True
+    target_aggregation: str = "max"
     mask_id: int = MASK_ID
 
 

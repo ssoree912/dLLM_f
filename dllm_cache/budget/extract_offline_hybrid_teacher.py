@@ -80,11 +80,16 @@ def parse_args(argv: Sequence[str] | None = None) -> ExtractOfflineHybridConfig:
     parser.add_argument(
         "--active-top-k",
         type=int,
-        default=128,
+        default=0,
         help="per-step attention support budget; 0 keeps all prompt positions",
     )
     parser.add_argument("--temperature", type=float, default=0.0)
-    parser.add_argument("--confidence-weight", action="store_true")
+    parser.add_argument(
+        "--confidence-weight",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="weight committed-token attention by generation confidence (default: true)",
+    )
     parser.add_argument("--target-aggregation", choices=["max", "sum"], default="max")
     parser.add_argument("--min-raw-length", type=int, default=0)
     parser.add_argument("--skip-matching-samples", type=int, default=0)

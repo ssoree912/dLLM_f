@@ -50,6 +50,7 @@ from lm_eval.api.model import LM
 class LLaDA(TemplateLM):
     AUTO_MODEL_CLASS = None
     _DEFAULT_MAX_LENGTH = 20480
+    _PRUNE_CACHE_MAX_LENGTH = 2048
 
     def __init__(
         self,
@@ -99,6 +100,7 @@ class LLaDA(TemplateLM):
         remasking: str = "low_confidence",
         mask_id: int = 126336,
         is_check_greedy : bool =True,
+        prune_cache_path: Optional[str] = None,
         student_path: Optional[str] = None,
         student_prompt_kv_cache: bool = False,
         student_prompt_prune: bool = False,
@@ -108,7 +110,7 @@ class LLaDA(TemplateLM):
         student_prompt_drift_refresh: bool = False,
         maskkv_student_scores: bool = False,
         student_drift_mode: str = "oracle",
-        student_delta_select_once: bool = False,
+        student_delta_select_once: bool = True,
         student_drift_ckpt: Optional[str] = None,
         student_drift_frozen_layers: int = 0,
         student_frozen_layers: int = 16,
@@ -140,6 +142,7 @@ class LLaDA(TemplateLM):
         self.cfg_interval_steps = cfg_interval_steps
         self.transfer_ratio = transfer_ratio
         self.is_check_greedy = is_check_greedy
+        self.prune_cache_path = prune_cache_path
         self.student_path = student_path
         self.student_prompt_kv_cache = self._coerce_bool(student_prompt_kv_cache)
         self.student_prompt_prune = self._coerce_bool(student_prompt_prune)
@@ -211,6 +214,29 @@ class LLaDA(TemplateLM):
         self.student_score_activation = str(student_score_activation).strip().lower()
         if self.student_score_activation not in {"softmax", "sigmoid", "raw"}:
             raise RuntimeError("student_score_activation must be one of: softmax, sigmoid, raw")
+        if self.prune_cache_path is not None:
+            legacy_modes = (
+                self.student_prompt_kv_cache,
+                self.student_prompt_prune,
+                self.student_prompt_pool_active,
+                self.student_prompt_dynamic_kv,
+                self.student_prompt_layer_split,
+                self.student_prompt_drift_refresh,
+                self.maskkv_student_scores,
+            )
+            if any(legacy_modes) or student_path is not None or student_refresh_path is not None:
+                raise RuntimeError(
+                    "prune_cache_path is the complete prune-cache configuration; "
+                    "do not combine it with legacy student_* options"
+                )
+            self.student_path = self.prune_cache_path
+            self.student_refresh_path = self.prune_cache_path
+            self.student_prompt_drift_refresh = True
+            self.student_drift_mode = "delta_student"
+            self.student_delta_select_once = True
+            self.student_refresh_interval = 1
+            self.student_question_window = 128
+            self.student_score_activation = "softmax"
         self.student = None
         self.add_bos_token = add_bos_token
         self.escape_until = escape_until
@@ -355,7 +381,19 @@ class LLaDA(TemplateLM):
                 f"Model type is '{self.config.model_type}', part of the Gemma family--a BOS token will be used as Gemma underperforms without it."
             )
 
-        self._max_length = max_length
+        if (
+            self.prune_cache_path is not None
+            and max_length is not None
+            and int(max_length) != self._PRUNE_CACHE_MAX_LENGTH
+        ):
+            raise RuntimeError(
+                f"prune_cache uses a fixed total context of {self._PRUNE_CACHE_MAX_LENGTH}"
+            )
+        self._max_length = (
+            self._PRUNE_CACHE_MAX_LENGTH
+            if self.prune_cache_path is not None
+            else max_length
+        )
         self.pretrained = pretrained
         self.delta = delta
         self.peft = peft
@@ -452,9 +490,16 @@ class LLaDA(TemplateLM):
                 raise RuntimeError("student prompt compression requires student_path")
             self.student = self._load_prompt_utility_student(self.student_path)
             if self.student_refresh_path is not None:
-                self.refresh_student = self._load_prompt_utility_student(
-                    self.student_refresh_path
-                )
+                if self.student_refresh_path == self.student_path:
+                    self.refresh_student = self.student
+                else:
+                    self.refresh_student = self._load_prompt_utility_student(
+                        self.student_refresh_path
+                    )
+            if self.prune_cache_path is not None:
+                from dllm_cache.budget.prune_cache import validate_prune_cache_heads
+
+                validate_prune_cache_heads(self.student.config.heads)
         if self.student_prompt_drift_refresh and self.student_drift_mode == "student":
             if self.student_drift_ckpt is None:
                 raise RuntimeError("student_drift_mode=student requires student_drift_ckpt")
@@ -488,7 +533,10 @@ class LLaDA(TemplateLM):
         student.to(self.device)
         student.eval()
         if self.rank == 0:
-            if self.student_prompt_pool_active:
+            if self.prune_cache_path is not None:
+                mode = "prune-cache"
+                budget_text = "keep=1/2 prompt, update=1/2 kept, update_set=frozen"
+            elif self.student_prompt_pool_active:
                 mode = "pool-active KV cache"
                 budget_text = (
                     f"pool_budget={self.student_pool_budget}, active_budget={self.student_budget}, "
@@ -704,9 +752,16 @@ class LLaDA(TemplateLM):
         from dllm_cache.budget.drift_refresh_kv import generate_with_drift_refresh
 
         scores = self._predict_student_scores(input_ids, head="attention")
-        budget = min(self.student_budget, int(input_ids.shape[1]))
+        if self.prune_cache_path is not None:
+            from dllm_cache.budget.prune_cache import split_prune_cache_budget
+
+            prune_budget = split_prune_cache_budget(int(input_ids.shape[1]))
+            budget = prune_budget.kept_tokens
+            refresh_tokens = prune_budget.updated_tokens
+        else:
+            budget = min(self.student_budget, int(input_ids.shape[1]))
+            refresh_tokens = self.student_refresh_tokens or max(1, budget // 4)
         keep = torch.topk(scores.mean(dim=0), k=budget, largest=True).indices.sort().values
-        refresh_tokens = self.student_refresh_tokens or max(1, budget // 4)
         return generate_with_drift_refresh(
             input_ids=input_ids,
             model=self.model,
@@ -1276,8 +1331,10 @@ class LLaDA(TemplateLM):
         bar = tqdm(total=len(requests), disable=(self.rank != 0), desc="Running generate_until requests")
         ds = [{"text": req.args[0]} for req in requests]
         ds = Dataset.from_list(ds)
-        gen_kwargs = requests[0].args[1]
-        gen_length = int(gen_kwargs.get("gen_length"))
+        from dllm_cache.budget.prune_cache import resolve_generation_kwargs
+
+        gen_kwargs = resolve_generation_kwargs(requests[0].args[1])
+        gen_length = int(gen_kwargs["gen_length"])
         left_truncate_len = max(1, self.max_length - gen_length)
         for batch in ds.iter(self.batch_size):
             contexts = batch["text"]

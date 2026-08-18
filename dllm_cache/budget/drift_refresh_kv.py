@@ -125,12 +125,15 @@ def select_delta_student_topk(
     heads = tuple(getattr(getattr(student, "config", None), "heads", ("score",)))
     selected_head = "delta" if "delta" in heads else None
     for layer_id, layer_hidden in enumerate(hidden):
+        forward_args = (
+            {"head": selected_head} if selected_head is not None else {}
+        )
         scores = student.forward_layer(
             layer_id,
             layer_hidden.float(),
             prompt_indices,
             question_indices,
-            head=selected_head,
+            **forward_args,
         )
         probabilities.append(torch.softmax(scores.float(), dim=-1).squeeze(0))
     pooled = torch.stack(probabilities).mean(dim=0)
@@ -317,7 +320,7 @@ def generate_with_drift_refresh(
     frozen_layers: int = 0,
     question_window: int = 128,
     refresh_interval: int = 1,
-    delta_select_once: bool = False,
+    delta_select_once: bool = True,
     steps: int = 128,
     gen_length: int = 128,
     block_length: int = 32,

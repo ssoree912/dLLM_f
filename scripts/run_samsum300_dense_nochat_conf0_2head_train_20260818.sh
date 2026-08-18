@@ -47,6 +47,7 @@ if [[ "${existing_teacher}" -lt 300 ]]; then
     --block-length 8 \
     --steps 128 \
     --active-top-k 0 \
+    --no-confidence-weight \
     --target-aggregation max \
     >"${LOG_ROOT}/extract_teacher.log" 2>&1
 else

@@ -65,7 +65,7 @@ def parse_train_config() -> TrainConfig:
             "delta",
             "attention_delta",
         ],
-        default="score",
+        default="attention_delta",
     )
     parser.add_argument("--loss-mode", choices=["auto", "mse", "bce"], default="auto")
     parser.add_argument("--bce-positive-weight", type=float, default=None)
