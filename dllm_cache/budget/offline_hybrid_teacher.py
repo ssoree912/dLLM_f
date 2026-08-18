@@ -39,7 +39,6 @@ class OfflineHybridTeacherConfig:
     temperature: float
     confidence_weight: bool
     target_aggregation: str
-    reference_query_mode: str = "commit"
     mask_id: int = MASK_ID
 
 
@@ -339,21 +338,11 @@ def generate_with_offline_hybrid_teacher(
                 x0, confidence = select_candidates(logits, suffix_ids, mask_index, candidate_config)
                 confidence[:, end:] = -torch.inf
                 transfer_index = build_transfer_index(confidence, transfer_counts[:, step_id])
-                if config.reference_query_mode == "commit":
-                    reference_index = transfer_index
-                else:
-                    # A generation position enters its lifetime when its block becomes
-                    # active and contributes at every step until it is committed. Future
-                    # blocks are deliberately excluded so a position is not rewarded
-                    # merely for waiting while an earlier block is decoded.
-                    reference_index = torch.zeros_like(mask_index)
-                    reference_index[:, start:end] = mask_index[:, start:end]
                 accumulate_reference(
                     trace,
                     prompt_attention,
-                    reference_index,
+                    transfer_index,
                     confidence,
-                    committed_count=int(transfer_index.sum().item()),
                 )
                 suffix_ids[transfer_index] = x0[transfer_index]
     finally:
@@ -388,10 +377,6 @@ def validate_offline_hybrid_config(config: OfflineHybridTeacherConfig) -> None:
         raise RuntimeError("active_top_k must be non-negative; zero disables teacher-side top-k")
     if config.target_aggregation not in {"max", "sum"}:
         raise RuntimeError(f"unsupported target aggregation: {config.target_aggregation}")
-    if config.reference_query_mode not in {"commit", "lifetime_mask"}:
-        raise RuntimeError(
-            f"unsupported reference query mode: {config.reference_query_mode}"
-        )
 
 
 def full_sequence_logits_and_signals(
@@ -416,16 +401,14 @@ def full_sequence_logits_and_signals(
 def accumulate_reference(
     trace: ReferenceTrace,
     prompt_attention: dict[int, torch.Tensor],
-    reference_index: torch.Tensor,
+    transfer_index: torch.Tensor,
     confidence: torch.Tensor,
-    *,
-    committed_count: int | None = None,
 ) -> None:
     """Match ``future_pool_teacher.accumulate_future_pool`` without step tensors."""
 
-    if reference_index.shape[0] != 1:
+    if transfer_index.shape[0] != 1:
         raise RuntimeError("offline hybrid teacher expects batch size 1")
-    selected = reference_index[0].nonzero(as_tuple=False).flatten()
+    selected = transfer_index[0].nonzero(as_tuple=False).flatten()
     if selected.numel() == 0:
         return
     weights = confidence[0].index_select(0, selected).clamp_min(0.0).float()
@@ -440,7 +423,7 @@ def accumulate_reference(
         trace.sum_scores[layer_id] += scores
         trace.max_scores[layer_id] = torch.maximum(trace.max_scores[layer_id], scores)
     trace.step_count += 1
-    trace.commit_count += int(selected.numel()) if committed_count is None else committed_count
+    trace.commit_count += int(selected.numel())
     trace.weight_sum += float(weights.sum().detach().cpu())
 
 

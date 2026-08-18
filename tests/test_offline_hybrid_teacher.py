@@ -195,9 +195,9 @@ def test_attention_method_is_restored_after_generation() -> None:
     assert block.attention.__func__ is original_function
 
 
-def test_lifetime_mask_reference_uses_all_active_steps_without_topk_support() -> None:
+def test_commit_reference_keeps_continuous_scores_when_topk_is_disabled() -> None:
     prompt_ids = torch.tensor([[2, 3, 4]], dtype=torch.long)
-    commit_result = generate_with_offline_hybrid_teacher(
+    result = generate_with_offline_hybrid_teacher(
         FakeModel(prompt_length=3),
         prompt_ids,
         OfflineHybridTeacherConfig(
@@ -208,37 +208,21 @@ def test_lifetime_mask_reference_uses_all_active_steps_without_topk_support() ->
             temperature=0.0,
             confidence_weight=False,
             target_aggregation="sum",
-            reference_query_mode="commit",
-            mask_id=9,
-        ),
-    )
-    lifetime_result = generate_with_offline_hybrid_teacher(
-        FakeModel(prompt_length=3),
-        prompt_ids,
-        OfflineHybridTeacherConfig(
-            gen_length=4,
-            block_length=2,
-            steps=4,
-            active_top_k=0,
-            temperature=0.0,
-            confidence_weight=False,
-            target_aggregation="sum",
-            reference_query_mode="lifetime_mask",
             mask_id=9,
         ),
     )
 
-    assert lifetime_result.reference_step_count == 4
-    assert lifetime_result.commit_count == 4
-    assert lifetime_result.weight_sum == 6.0
-    assert torch.all(lifetime_result.ref_union_mask)
-    assert torch.equal(lifetime_result.ref_union_size_by_layer, torch.tensor([3, 3]))
-    assert torch.all(lifetime_result.teacher_raw > commit_result.teacher_raw)
-    expected_norm = lifetime_result.teacher_raw / lifetime_result.teacher_raw.sum(
+    assert result.reference_step_count == 4
+    assert result.commit_count == 4
+    assert result.weight_sum == 4.0
+    assert torch.all(result.ref_union_mask)
+    assert torch.equal(result.ref_union_size_by_layer, torch.tensor([3, 3]))
+    assert torch.all(result.teacher_raw > 0)
+    expected_norm = result.teacher_raw / result.teacher_raw.sum(
         dim=-1, keepdim=True
     ).clamp_min(1e-6)
-    assert torch.allclose(lifetime_result.teacher_norm, expected_norm)
-    assert lifetime_result.delta_observation_count == 3
+    assert torch.allclose(result.teacher_norm, expected_norm)
+    assert result.delta_observation_count == 3
 
 
 if __name__ == "__main__":
@@ -246,5 +230,5 @@ if __name__ == "__main__":
     test_collector_accumulates_kv_path_length_and_step_max()
     test_reference_signal_matches_existing_future_pool_teacher()
     test_attention_method_is_restored_after_generation()
-    test_lifetime_mask_reference_uses_all_active_steps_without_topk_support()
+    test_commit_reference_keeps_continuous_scores_when_topk_is_disabled()
     print("ok")

@@ -13,9 +13,9 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 PYTHON=/opt/conda/envs/dllm/bin/python
 MODEL=/workspace/dllm/model/LLaDA-8B-Instruct
 SOURCE_ROOT=results/budget/prompt_source_300each_11dataset_20260818
-OUTPUT_ROOT=results/budget/offline_lifetime_attention_delta_teacher_300each_chat_notopk_20260818
+OUTPUT_ROOT=results/budget/offline_commit_attention_delta_teacher_300each_chat_notopk_20260818
 LOG_ROOT=results/budget/teacher_run_logs
-LOG_FILE="${LOG_ROOT}/lifetime_attention_delta_300each_chat_notopk_20260818.log"
+LOG_FILE="${LOG_ROOT}/commit_attention_delta_300each_chat_notopk_20260818.log"
 
 DATASETS=(
   2wikimultihopqa_train
@@ -82,8 +82,8 @@ fi
 
 mkdir -p "${OUTPUT_ROOT}" "${LOG_ROOT}"
 
-echo "[extract] lifetime Attention + cumulative Delta in one trajectory"
-echo "[extract] chat_template=true active_top_k=0 aggregation=sum samples=11x300"
+echo "[extract] commit-time continuous Attention + cumulative Delta in one trajectory"
+echo "[extract] chat_template=true active_top_k=0 aggregation=max samples=11x300"
 "${PYTHON}" -m dllm_cache.budget.extract_offline_hybrid_from_shards \
   --model "${MODEL}" \
   --source-root "${SOURCE_ROOT}" \
@@ -96,9 +96,8 @@ echo "[extract] chat_template=true active_top_k=0 aggregation=sum samples=11x300
   --block-length 8 \
   --steps 128 \
   --active-top-k 0 \
-  --reference-query-mode lifetime_mask \
   --confidence-weight \
-  --target-aggregation sum \
+  --target-aggregation max \
   --apply-chat-template >"${LOG_FILE}" 2>&1 &
 ACTIVE_PID=$!
 wait "${ACTIVE_PID}"

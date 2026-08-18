@@ -47,7 +47,6 @@ class ExtractFromShardsConfig:
     temperature: float
     confidence_weight: bool
     target_aggregation: str
-    reference_query_mode: str
     apply_chat_template: bool
     max_length: int
     question_window: int
@@ -77,13 +76,6 @@ def parse_args(argv: Sequence[str] | None = None) -> ExtractFromShardsConfig:
     parser.add_argument("--confidence-weight", action="store_true")
     parser.add_argument("--target-aggregation", choices=["max", "sum"], default="max")
     parser.add_argument(
-        "--reference-query-mode",
-        choices=["commit", "lifetime_mask"],
-        default="commit",
-        help="commit uses only newly revealed positions; lifetime_mask uses every "
-        "still-masked position in the active block until reveal",
-    )
-    parser.add_argument(
         "--apply-chat-template",
         action="store_true",
         help="decode the stored prompt tokens, wrap them the way the inference harness "
@@ -108,7 +100,6 @@ def parse_args(argv: Sequence[str] | None = None) -> ExtractFromShardsConfig:
         temperature=args.temperature,
         confidence_weight=args.confidence_weight,
         target_aggregation=args.target_aggregation,
-        reference_query_mode=args.reference_query_mode,
         apply_chat_template=args.apply_chat_template,
         max_length=args.max_length,
         question_window=args.question_window,
@@ -163,31 +154,21 @@ def extract_one(model: torch.nn.Module, tokenizer, src: dict, config: ExtractFro
         temperature=config.temperature,
         confidence_weight=config.confidence_weight,
         target_aggregation=config.target_aggregation,
-        reference_query_mode=config.reference_query_mode,
     )
     result = generate_with_offline_hybrid_teacher(model, prompt_ids, teacher_config)
     generated_answer = tokenizer.batch_decode(
         result.generated_ids.unsqueeze(0), skip_special_tokens=True
     )[0].strip()
     prompt_length = int(prompt_tensor.numel())
-    reference_queries = (
-        "active_block_mask_queries_until_commit"
-        if config.reference_query_mode == "lifetime_mask"
-        else "newly_committed_queries"
-    )
     reference_support = (
         "all_prompt_positions"
         if config.active_top_k == 0
         else "temporal_union_topk_support"
     )
     return {
-        "teacher_kind": (
-            "offline_lifetime_attention_delta"
-            if config.reference_query_mode == "lifetime_mask"
-            else "offline_hybrid_ref_delta"
-        ),
+        "teacher_kind": "offline_hybrid_ref_delta",
         "teacher_formula": (
-            f"reference={config.target_aggregation}_step_{reference_queries}_"
+            f"reference={config.target_aggregation}_step_newly_committed_queries_"
             f"suffix_to_prompt_attention_{reference_support}; "
             "delta=sum_t mean(K_relative_stepwise,V_relative_stepwise)"
         ),
@@ -224,7 +205,7 @@ def extract_one(model: torch.nn.Module, tokenizer, src: dict, config: ExtractFro
         "steps": config.steps,
         "active_top_k": config.active_top_k,
         "target_aggregation": config.target_aggregation,
-        "reference_query_mode": config.reference_query_mode,
+        "reference_query_mode": "commit",
         "prompt_format": src.get("prompt_format", ""),
         "apply_chat_template": int(config.apply_chat_template),
         "reference_step_count": result.reference_step_count,

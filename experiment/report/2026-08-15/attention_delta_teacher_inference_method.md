@@ -4,7 +4,7 @@
 
 현재 방법은 생성 trajectory 전체를 관찰하여 두 종류의 prompt-token teacher score를 만든다.
 
-1. **Attention teacher**: 각 active mask 위치가 확정될 때까지 반복해서 참조한 prompt 위치
+1. **Attention teacher**: 각 생성 위치가 확정되는 결정 시점에 참조한 prompt 위치
 2. **Delta teacher**: 생성 과정에서 K/V가 누적해서 많이 변한 prompt 위치
 
 두 teacher로 별도의 student를 학습하고, 추론 시 다음 순서로 사용한다.
@@ -36,7 +36,7 @@
 - $t$: denoising step
 - $l$: transformer layer
 - $h$: attention head
-- $M_t$: step $t$에서 현재 block 안에 아직 mask로 남아 있는 생성 위치 집합
+- $C_t$: step $t$에서 새로 확정되는 생성 위치 집합
 - $P$: prompt 길이
 - $T$: 전체 denoising step 수
 - $L$: transformer layer 수
@@ -62,32 +62,28 @@ $$
 \right)
 $$
 
-현재 block에서 아직 mask로 남아 있는 모든 위치의 attention을 합산한다.
+이번 step에서 새로 확정되는 위치의 attention만 합산한다.
 
 $$
 a_{t,l,p}
 =
-\sum_{j\in M_t}
+\sum_{j\in C_t}
 w_{t,j}\alpha_{t,l,j,p}
 $$
 
-$w_{t,j}$는 위치 $j$에서 현재 예측한 token의 confidence이다. 위치 $j$는 자기 block이 활성화된 시점부터 실제 token으로 확정되는 step까지 매번 기여한다. 미래 block의 mask는 아직 decoding 대상이 아니므로 $M_t$에서 제외한다.
+$w_{t,j}$는 확정 위치 $j$에서 예측한 token의 confidence이다. 위치 $j$가 이전 step에서 mask로 남아 있을 때의 attention은 target에 포함하지 않으며, 확정 직전 forward에서 정확히 한 번 기여한다.
 
-### 3.2 전체 lifetime 누적
+### 3.2 시간축 최대값과 continuous support
 
-모든 active-mask step의 attention을 시간축으로 합산한다.
+원래 Attention teacher와 동일하게 step별 score의 시간축 최대값을 사용한다.
 
 $$
 A_{l,p}
 =
-\sum_{t=1}^{T}a_{t,l,p}
-=
-\sum_{t=1}^{T}
-\sum_{j\in M_t}
-w_{t,j}\alpha_{t,l,j,p}
+\max_{t=1,\ldots,T}a_{t,l,p}
 $$
 
-현재 `active_top_k=0`이므로 teacher 추출 단계에서 prompt 위치를 top-k로 자르지 않는다. 모든 prompt 위치의 연속 score를 보존한다.
+단, 이전 teacher의 step별 top 128 temporal-union mask는 사용하지 않는다. `active_top_k=0`으로 모든 prompt 위치의 연속 score를 보존하고, budget은 student scorer를 적용하는 추론 시점에만 부여한다.
 
 ### 3.3 정규화
 
@@ -102,7 +98,7 @@ $$
 
 이 값이 teacher shard의 `teacher_norm`이며 Attention student의 학습 target이다.
 
-> 2026-08-18 이전 teacher는 새로 확정되는 위치의 commit 직전 attention만 사용하고 step별 top 128 union/max를 적용했다. 현재 replacement teacher는 그 legacy 정의를 사용하지 않는다.
+> 이전 teacher와 query 시점 및 max 집계는 같고, 차이는 teacher-side top 128 support mask를 제거했다는 점뿐이다.
 
 ---
 
@@ -367,9 +363,9 @@ Teacher는 모든 prompt 위치의 연속 score를 저장하고, budget은 추�
 | Generation length | 128 |
 | Steps | 128 |
 | Block length | 8 |
-| Attention query mode | active-block lifetime mask |
+| Attention query mode | newly committed positions only |
 | Attention active top-k | 0 (비활성화) |
-| Attention aggregation | sum |
+| Attention aggregation | max |
 | Chat template | 적용 |
 
 ### 9.2 LongBench 평가
@@ -442,8 +438,9 @@ for each denoising step t:
     full forward [prompt + suffix]
 
     Attention teacher:
-        현재 block에서 아직 mask인 모든 위치 -> prompt attention 합산
-        각 위치가 확정될 때까지 매 step 반복 누적
+        이번 step에 새로 확정되는 위치 -> prompt attention 합산
+        각 위치는 확정 직전 forward에서 한 번만 기여
+        시간축 max 집계
         teacher-side top-k 없이 모든 prompt 위치 score 유지
 
     Delta teacher:

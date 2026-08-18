@@ -55,7 +55,6 @@ class ExtractOfflineHybridConfig:
     temperature: float
     confidence_weight: bool
     target_aggregation: str
-    reference_query_mode: str
     min_raw_length: int
     skip_matching_samples: int
     prompt_format: str
@@ -87,13 +86,6 @@ def parse_args(argv: Sequence[str] | None = None) -> ExtractOfflineHybridConfig:
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--confidence-weight", action="store_true")
     parser.add_argument("--target-aggregation", choices=["max", "sum"], default="max")
-    parser.add_argument(
-        "--reference-query-mode",
-        choices=["commit", "lifetime_mask"],
-        default="commit",
-        help="commit uses only newly revealed positions; lifetime_mask uses every "
-        "still-masked position in the active block until reveal",
-    )
     parser.add_argument("--min-raw-length", type=int, default=0)
     parser.add_argument("--skip-matching-samples", type=int, default=0)
     parser.add_argument(
@@ -126,7 +118,6 @@ def parse_args(argv: Sequence[str] | None = None) -> ExtractOfflineHybridConfig:
         temperature=args.temperature,
         confidence_weight=args.confidence_weight,
         target_aggregation=args.target_aggregation,
-        reference_query_mode=args.reference_query_mode,
         min_raw_length=args.min_raw_length,
         skip_matching_samples=args.skip_matching_samples,
         prompt_format=args.prompt_format,
@@ -179,7 +170,6 @@ def extract_one(
         temperature=config.temperature,
         confidence_weight=config.confidence_weight,
         target_aggregation=config.target_aggregation,
-        reference_query_mode=config.reference_query_mode,
     )
     result = generate_with_offline_hybrid_teacher(model, prompt_ids, teacher_config)
     generated_answer = tokenizer.batch_decode(
@@ -187,24 +177,15 @@ def extract_one(
         skip_special_tokens=True,
     )[0].strip()
     prompt_tensor = torch.tensor(example.prompt_ids, dtype=torch.long)
-    reference_queries = (
-        "active_block_mask_queries_until_commit"
-        if config.reference_query_mode == "lifetime_mask"
-        else "newly_committed_queries"
-    )
     reference_support = (
         "all_prompt_positions"
         if config.active_top_k == 0
         else "temporal_union_topk_support"
     )
     return {
-        "teacher_kind": (
-            "offline_lifetime_attention_delta"
-            if config.reference_query_mode == "lifetime_mask"
-            else "offline_hybrid_ref_delta"
-        ),
+        "teacher_kind": "offline_hybrid_ref_delta",
         "teacher_formula": (
-            f"reference={config.target_aggregation}_step_{reference_queries}_"
+            f"reference={config.target_aggregation}_step_newly_committed_queries_"
             f"suffix_to_prompt_attention_{reference_support}; "
             "delta=sum_t mean(K_relative_stepwise,V_relative_stepwise)"
         ),
@@ -238,7 +219,7 @@ def extract_one(
         "steps": config.steps,
         "active_top_k": config.active_top_k,
         "target_aggregation": config.target_aggregation,
-        "reference_query_mode": config.reference_query_mode,
+        "reference_query_mode": "commit",
         "prompt_format": config.prompt_format,
         "apply_chat_template": int(config.apply_chat_template),
         "fewshot_context_chars": config.fewshot_context_chars,
