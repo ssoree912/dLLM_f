@@ -3,16 +3,12 @@
 # dependencies = ["torch", "transformers"]
 # ///
 
-"""Extract reference+delta teacher shards re-using prompts from existing teacher shards.
+"""Extract Attention+Delta teacher shards from reusable prompt-source shards.
 
-The 11-dataset keep teacher (future_pool_teacher_train_300each_g128_top128) was
-extracted on a machine whose source jsonl files are not available here, but every
-shard carries `prompt_input_ids`. Since the hybrid extractor only needs prompt
-tokens, reading them from those shards gives the delta signal for all datasets
-without the source data -- and, more importantly, on *exactly* the prompts the keep
-student was trained on, so the keep and delta students share one training
-distribution (the samsum-only delta student was trained on chat-templated
-eval-fewshot prompts instead, a mismatch this path removes).
+The source may be a legacy teacher root or a prompt-only root produced by
+``export_prompt_source_from_teacher``.  Only prompt tokens and sample metadata are
+required.  This lets a replacement teacher preserve the exact balanced sample
+population without retaining obsolete teacher labels.
 
 Output shards follow extract_offline_hybrid_teacher.py's schema (teacher_raw /
 teacher_norm / ref_union_mask / delta_raw / delta_norm / delta_step_max).
@@ -70,7 +66,12 @@ def parse_args(argv: Sequence[str] | None = None) -> ExtractFromShardsConfig:
     parser.add_argument("--gen-length", type=int, default=128)
     parser.add_argument("--block-length", type=int, default=8)
     parser.add_argument("--steps", type=int, default=128)
-    parser.add_argument("--active-top-k", type=int, default=128)
+    parser.add_argument(
+        "--active-top-k",
+        type=int,
+        default=128,
+        help="per-step attention support budget; 0 keeps all prompt positions",
+    )
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--confidence-weight", action="store_true")
     parser.add_argument("--target-aggregation", choices=["max", "sum"], default="max")
@@ -159,15 +160,23 @@ def extract_one(model: torch.nn.Module, tokenizer, src: dict, config: ExtractFro
         result.generated_ids.unsqueeze(0), skip_special_tokens=True
     )[0].strip()
     prompt_length = int(prompt_tensor.numel())
+    reference_support = (
+        "all_prompt_positions"
+        if config.active_top_k == 0
+        else "temporal_union_topk_support"
+    )
     return {
         "teacher_kind": "offline_hybrid_ref_delta",
         "teacher_formula": (
-            f"reference={config.target_aggregation}_step_committed_suffix_to_prompt_attention_"
-            "masked_by_temporal_union_topk; "
+            f"reference={config.target_aggregation}_step_newly_committed_queries_"
+            f"suffix_to_prompt_attention_{reference_support}; "
             "delta=sum_t mean(K_relative_stepwise,V_relative_stepwise)"
         ),
         "teacher_graph": "full_sequence_prompt_suffix_single_forward_ref_and_delta",
-        "prompt_source": "reused_from_existing_teacher_shard",
+        "prompt_source": src.get(
+            "prompt_source_kind", "reused_from_existing_teacher_shard"
+        ),
+        "source_teacher_kind": src.get("source_teacher_kind", ""),
         "sample_id": src["sample_id"],
         "dataset": src["dataset"],
         "task": src.get("task", ""),
@@ -196,6 +205,7 @@ def extract_one(model: torch.nn.Module, tokenizer, src: dict, config: ExtractFro
         "steps": config.steps,
         "active_top_k": config.active_top_k,
         "target_aggregation": config.target_aggregation,
+        "reference_query_mode": "commit",
         "prompt_format": src.get("prompt_format", ""),
         "apply_chat_template": int(config.apply_chat_template),
         "reference_step_count": result.reference_step_count,

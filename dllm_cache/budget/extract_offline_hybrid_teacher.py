@@ -77,7 +77,12 @@ def parse_args(argv: Sequence[str] | None = None) -> ExtractOfflineHybridConfig:
     parser.add_argument("--gen-length", type=int, default=128)
     parser.add_argument("--block-length", type=int, default=8)
     parser.add_argument("--steps", type=int, default=128)
-    parser.add_argument("--active-top-k", type=int, default=128)
+    parser.add_argument(
+        "--active-top-k",
+        type=int,
+        default=128,
+        help="per-step attention support budget; 0 keeps all prompt positions",
+    )
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--confidence-weight", action="store_true")
     parser.add_argument("--target-aggregation", choices=["max", "sum"], default="max")
@@ -172,16 +177,18 @@ def extract_one(
         skip_special_tokens=True,
     )[0].strip()
     prompt_tensor = torch.tensor(example.prompt_ids, dtype=torch.long)
-    reference_formula = (
-        f"reference={config.target_aggregation}_step_committed_suffix_to_prompt_attention_dense_all_prompt; "
-        if config.active_top_k <= 0
-        else f"reference={config.target_aggregation}_step_committed_suffix_to_prompt_attention_"
-        "masked_by_temporal_union_topk; "
+    reference_support = (
+        "all_prompt_positions"
+        if config.active_top_k == 0
+        else "temporal_union_topk_support"
     )
     return {
         "teacher_kind": "offline_hybrid_ref_delta",
-        "teacher_formula": reference_formula
-        + "delta=sum_t mean(K_relative_stepwise,V_relative_stepwise)",
+        "teacher_formula": (
+            f"reference={config.target_aggregation}_step_newly_committed_queries_"
+            f"suffix_to_prompt_attention_{reference_support}; "
+            "delta=sum_t mean(K_relative_stepwise,V_relative_stepwise)"
+        ),
         "teacher_graph": "full_sequence_prompt_suffix_single_forward_ref_and_delta",
         "sample_id": sample.sample_id,
         "dataset": sample.dataset,
@@ -212,6 +219,7 @@ def extract_one(
         "steps": config.steps,
         "active_top_k": config.active_top_k,
         "target_aggregation": config.target_aggregation,
+        "reference_query_mode": "commit",
         "prompt_format": config.prompt_format,
         "apply_chat_template": int(config.apply_chat_template),
         "fewshot_context_chars": config.fewshot_context_chars,

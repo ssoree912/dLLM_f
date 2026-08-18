@@ -22,7 +22,7 @@ from dllm_cache.budget.full_dynamic_trajectory_teacher import (
     build_transfer_index,
     select_candidates,
 )
-from dllm_cache.budget.future_pool_teacher import normalize_scores, validate_generation_shape
+from dllm_cache.budget.future_pool_teacher import normalize_scores
 from dllm_cache.budget.prompt_kv_cache import project_heads, repeat_heads
 from utils.generate_function import get_num_transfer_tokens
 
@@ -60,7 +60,12 @@ class OfflineHybridTeacherResult:
 
 @dataclass(slots=True)
 class ReferenceTrace:
-    """Running reference score and temporal-union state."""
+    """Running reference score and optional temporal-union state.
+
+    ``active_top_k == 0`` means that no teacher-side support budget is applied:
+    every prompt position remains in the support and the continuous aggregate is
+    normalized directly.
+    """
 
     sum_scores: torch.Tensor
     max_scores: torch.Tensor
@@ -79,8 +84,6 @@ class ReferenceTrace:
                 raw = self.sum_scores
             case _:
                 raise RuntimeError(f"unsupported target aggregation: {target_aggregation}")
-        if self.active_top_k <= 0:
-            return raw
         return raw * self.union_mask.float()
 
 
@@ -297,7 +300,12 @@ def generate_with_offline_hybrid_teacher(
     trace = ReferenceTrace(
         sum_scores=torch.zeros((layer_count, prompt_length), device=prompt_ids.device),
         max_scores=torch.zeros((layer_count, prompt_length), device=prompt_ids.device),
-        union_mask=torch.zeros((layer_count, prompt_length), dtype=torch.bool, device=prompt_ids.device),
+        union_mask=torch.full(
+            (layer_count, prompt_length),
+            fill_value=config.active_top_k == 0,
+            dtype=torch.bool,
+            device=prompt_ids.device,
+        ),
         confidence_weight=config.confidence_weight,
         active_top_k=config.active_top_k,
     )
@@ -330,7 +338,12 @@ def generate_with_offline_hybrid_teacher(
                 x0, confidence = select_candidates(logits, suffix_ids, mask_index, candidate_config)
                 confidence[:, end:] = -torch.inf
                 transfer_index = build_transfer_index(confidence, transfer_counts[:, step_id])
-                accumulate_reference(trace, prompt_attention, transfer_index, confidence)
+                accumulate_reference(
+                    trace,
+                    prompt_attention,
+                    transfer_index,
+                    confidence,
+                )
                 suffix_ids[transfer_index] = x0[transfer_index]
     finally:
         collector.restore()
@@ -355,7 +368,13 @@ def generate_with_offline_hybrid_teacher(
 
 
 def validate_offline_hybrid_config(config: OfflineHybridTeacherConfig) -> None:
-    validate_generation_shape(config)
+    if config.gen_length % config.block_length != 0:
+        raise RuntimeError("gen_length must be divisible by block_length")
+    num_blocks = config.gen_length // config.block_length
+    if config.steps % num_blocks != 0:
+        raise RuntimeError("steps must be divisible by number of blocks")
+    if config.active_top_k < 0:
+        raise RuntimeError("active_top_k must be non-negative; zero disables teacher-side top-k")
     if config.target_aggregation not in {"max", "sum"}:
         raise RuntimeError(f"unsupported target aggregation: {config.target_aggregation}")
 

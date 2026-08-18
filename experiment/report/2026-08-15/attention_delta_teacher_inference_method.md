@@ -4,7 +4,7 @@
 
 현재 방법은 생성 trajectory 전체를 관찰하여 두 종류의 prompt-token teacher score를 만든다.
 
-1. **Attention teacher**: 실제 생성 토큰이 많이 참조한 prompt 위치
+1. **Attention teacher**: 각 생성 위치가 확정되는 결정 시점에 참조한 prompt 위치
 2. **Delta teacher**: 생성 과정에서 K/V가 누적해서 많이 변한 prompt 위치
 
 두 teacher로 별도의 student를 학습하고, 추론 시 다음 순서로 사용한다.
@@ -36,7 +36,7 @@
 - $t$: denoising step
 - $l$: transformer layer
 - $h$: attention head
-- $C_t$: step $t$에서 새로 확정되는 생성 토큰 집합
+- $C_t$: step $t$에서 새로 확정되는 생성 위치 집합
 - $P$: prompt 길이
 - $T$: 전체 denoising step 수
 - $L$: transformer layer 수
@@ -62,7 +62,7 @@ $$
 \right)
 $$
 
-이번 step에서 확정되는 생성 토큰들의 attention을 합산한다.
+이번 step에서 새로 확정되는 위치의 attention만 합산한다.
 
 $$
 a_{t,l,p}
@@ -71,34 +71,23 @@ a_{t,l,p}
 w_{t,j}\alpha_{t,l,j,p}
 $$
 
-$w_{t,j}$는 확정 토큰 $j$의 confidence이다. 현재 teacher shard는 confidence weighting을 사용한다.
+$w_{t,j}$는 확정 위치 $j$에서 예측한 token의 confidence이다. 위치 $j$가 이전 step에서 mask로 남아 있을 때의 attention은 target에 포함하지 않으며, 확정 직전 forward에서 정확히 한 번 기여한다.
 
-### 3.2 Step별 top 128 temporal union
+### 3.2 시간축 최대값과 continuous support
 
-각 step과 layer에서 attention 상위 128개 prompt 위치를 구한다.
-
-$$
-S_{t,l}=\operatorname{TopK}_{128}(a_{t,l,:})
-$$
-
-생성 trajectory가 끝날 때까지 이 집합을 union한다.
-
-$$
-U_l=\bigcup_{t=1}^{T}S_{t,l}
-$$
-
-### 3.3 시간축 최대값
-
-현재 `target_aggregation=max`이므로, union에 한 번이라도 들어온 토큰만 남기고 시간축 최대 attention을 최종 중요도로 사용한다.
+원래 Attention teacher와 동일하게 step별 score의 시간축 최대값을 사용한다.
 
 $$
 A_{l,p}
 =
-\mathbf 1[p\in U_l]
-\max_t a_{t,l,p}
+\max_{t=1,\ldots,T}a_{t,l,p}
 $$
 
-마지막으로 각 layer에서 prompt 방향 합이 1이 되도록 정규화한다.
+단, 이전 teacher의 step별 top 128 temporal-union mask는 사용하지 않는다. `active_top_k=0`으로 모든 prompt 위치의 연속 score를 보존하고, budget은 student scorer를 적용하는 추론 시점에만 부여한다.
+
+### 3.3 정규화
+
+각 layer에서 prompt 방향 합이 1이 되도록 정규화한다.
 
 $$
 \hat A_{l,p}
@@ -109,7 +98,7 @@ $$
 
 이 값이 teacher shard의 `teacher_norm`이며 Attention student의 학습 target이다.
 
-> Attention teacher의 누적은 모든 step의 attention 값을 단순 합산하는 방식이 아니다. **Step별 top 128의 temporal union을 만들고, 그 union 안에서 step별 attention의 최대값을 사용하는 방식**이다.
+> 이전 teacher와 query 시점 및 max 집계는 같고, 차이는 teacher-side top 128 support mask를 제거했다는 점뿐이다.
 
 ---
 
@@ -355,11 +344,11 @@ $$
 
 | 값 | 적용 시점 | 역할 |
 |---:|---|---|
-| 128 | Attention teacher 추출 | Step별 temporal union 후보 수 |
+| 0 | Attention teacher 추출 | `active_top_k=0`: teacher-side top-k 비활성화 |
 | 960 | 추론 | 실제로 남길 prompt 토큰 수 |
 | 480 | 추론 | 매 step K/V를 갱신할 prompt 토큰 수 |
 
-Teacher의 top 128과 추론의 960/480은 서로 다른 목적의 값이다.
+Teacher는 모든 prompt 위치의 연속 score를 저장하고, budget은 추론의 960/480에서만 적용한다.
 
 ---
 
@@ -374,7 +363,8 @@ Teacher의 top 128과 추론의 960/480은 서로 다른 목적의 값이다.
 | Generation length | 128 |
 | Steps | 128 |
 | Block length | 8 |
-| Attention active top-k | 128 |
+| Attention query mode | newly committed positions only |
+| Attention active top-k | 0 (비활성화) |
 | Attention aggregation | max |
 | Chat template | 적용 |
 
@@ -407,9 +397,9 @@ steps = gen_length
 
 ---
 
-## 10. 현재 Attention-template ablation
+## 10. 완료된 legacy Attention-template ablation
 
-현재 두 방법은 Delta teacher와 추론 방법은 동일하고 Attention student만 다르다.
+아래 비교는 2026-08-18 이전 commit-only/top128 Attention teacher로 완료한 실험이다. 결과는 보존하지만 해당 teacher shard는 현재 active teacher에서 제외했다.
 
 ### 방법 A
 
@@ -448,9 +438,10 @@ for each denoising step t:
     full forward [prompt + suffix]
 
     Attention teacher:
-        이번 step 확정 토큰 -> prompt attention 합산
-        layer별 top 128을 temporal union에 추가
-        시간축 최대 attention 갱신
+        이번 step에 새로 확정되는 위치 -> prompt attention 합산
+        각 위치는 확정 직전 forward에서 한 번만 기여
+        시간축 max 집계
+        teacher-side top-k 없이 모든 prompt 위치 score 유지
 
     Delta teacher:
         모든 prompt 토큰의 K/V 상대 변화량 측정

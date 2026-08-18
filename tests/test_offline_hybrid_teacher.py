@@ -195,9 +195,40 @@ def test_attention_method_is_restored_after_generation() -> None:
     assert block.attention.__func__ is original_function
 
 
+def test_commit_reference_keeps_continuous_scores_when_topk_is_disabled() -> None:
+    prompt_ids = torch.tensor([[2, 3, 4]], dtype=torch.long)
+    result = generate_with_offline_hybrid_teacher(
+        FakeModel(prompt_length=3),
+        prompt_ids,
+        OfflineHybridTeacherConfig(
+            gen_length=4,
+            block_length=2,
+            steps=4,
+            active_top_k=0,
+            temperature=0.0,
+            confidence_weight=False,
+            target_aggregation="sum",
+            mask_id=9,
+        ),
+    )
+
+    assert result.reference_step_count == 4
+    assert result.commit_count == 4
+    assert result.weight_sum == 4.0
+    assert torch.all(result.ref_union_mask)
+    assert torch.equal(result.ref_union_size_by_layer, torch.tensor([3, 3]))
+    assert torch.all(result.teacher_raw > 0)
+    expected_norm = result.teacher_raw / result.teacher_raw.sum(
+        dim=-1, keepdim=True
+    ).clamp_min(1e-6)
+    assert torch.allclose(result.teacher_norm, expected_norm)
+    assert result.delta_observation_count == 3
+
+
 if __name__ == "__main__":
     test_normalized_prompt_movement_matches_relative_l2_per_position()
     test_collector_accumulates_kv_path_length_and_step_max()
     test_reference_signal_matches_existing_future_pool_teacher()
     test_attention_method_is_restored_after_generation()
+    test_commit_reference_keeps_continuous_scores_when_topk_is_disabled()
     print("ok")
