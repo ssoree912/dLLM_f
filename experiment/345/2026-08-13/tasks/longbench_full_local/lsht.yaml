@@ -3,9 +3,11 @@ tag:
   - longbench_fewshot_tasks
   - longbench_tasks
 task: longbench_lsht
-dataset_path: /workspace/dllm/data/eval/longbench
+dataset_path: json
+dataset_kwargs:
+  data_files:
+    test: /home/M2026107/dllm/data/longbench/lsht.jsonl
 test_split: test
-dataset_name: lsht
 doc_to_text: "请判断给定新闻的类别，下面是一些例子。\n\n{{context}}\n{{question}}"
 doc_to_target: '{{answers}}'
 process_results: !function metrics.get_classification_with_score

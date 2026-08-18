@@ -3,9 +3,11 @@ tag:
   - longbench_code_tasks_e
   - longbench_tasks_e
 task: longbench_repobench-p_e
-dataset_path: /workspace/dllm/data/eval/longbench
+dataset_path: json
+dataset_kwargs:
+  data_files:
+    test: /home/M2026107/dllm/data/longbench/repobench-p_e.jsonl
 test_split: test
-dataset_name: repobench-p_e
 doc_to_text: "Please complete the code given below. \n{{context}}{{question}}Next line of code:"
 doc_to_target: '{{answers}}'
 process_results: !function metrics.get_code_sim_with_score

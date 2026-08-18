@@ -3,9 +3,11 @@ tag:
   - longbench_fewshot_tasks_e
   - longbench_tasks_e
 task: longbench_samsum_e
-dataset_path: /workspace/dllm/data/eval/longbench
+dataset_path: json
+dataset_kwargs:
+  data_files:
+    test: /home/M2026107/dllm/data/longbench/samsum_e.jsonl
 test_split: test
-dataset_name: samsum_e
 doc_to_text: "Summarize the dialogue into a few short sentences. The following are some examples.\n\n{{context}}\n{{question}}"
 doc_to_target: '{{answers}}'
 target_delimiter: ""

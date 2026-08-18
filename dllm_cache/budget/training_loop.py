@@ -81,6 +81,7 @@ def build_student(model: torch.nn.Module, config: TrainConfig) -> PromptUtilityS
         hidden_dim=int(getattr(model_config, "d_model", 4096)),
         proj_dim=config.proj_dim,
         mlp_dim=config.mlp_dim,
+        heads=("attention", "delta") if config.target_mode == "attention_delta" else ("score",),
     )
     student = PromptUtilityStudent(student_config)
     params = sum(p.numel() for p in student.parameters() if p.requires_grad)
@@ -166,6 +167,8 @@ def train_one_file(runtime: TrainingRuntime, path: Path) -> tuple[float, float, 
     hidden_states = compute_prompt_hidden_states(runtime, rec["prompt_input_ids"])
     prompt_indices = rec["prompt_token_indices"].to(runtime.config.device)
     question_indices = rec["question_token_indices"].to(runtime.config.device)
+    if runtime.config.target_mode == "attention_delta":
+        return train_one_file_attention_delta(runtime, rec, hidden_states, prompt_indices, question_indices)
     teacher_targets = teacher_targets_from_record(rec, runtime.config).to(runtime.config.device)
     target_count = int(teacher_targets.shape[0])
     runtime.optimizer.zero_grad(set_to_none=True)
@@ -197,6 +200,49 @@ def train_one_file(runtime: TrainingRuntime, path: Path) -> tuple[float, float, 
     )
 
 
+def train_one_file_attention_delta(
+    runtime: TrainingRuntime,
+    rec: dict,
+    hidden_states: tuple[torch.Tensor, ...],
+    prompt_indices: torch.Tensor,
+    question_indices: torch.Tensor,
+) -> tuple[float, float, float, float]:
+    attention_target = rec["teacher_norm"].float().to(runtime.config.device)
+    delta_target = rec["delta_norm"].float().to(runtime.config.device)
+    runtime.optimizer.zero_grad(set_to_none=True)
+    loss_total = torch.zeros((), dtype=torch.float32, device=runtime.config.device)
+    primary_total = rank_total = topk_total = 0.0
+    for layer_id in runtime.student.layer_indices:
+        hidden = hidden_states[layer_id].float()
+        for head, target_by_layer in (
+            ("attention", attention_target),
+            ("delta", delta_target),
+        ):
+            scores = runtime.student.forward_layer(
+                layer_id,
+                hidden,
+                prompt_indices,
+                question_indices,
+                head=head,
+            )
+            target = target_by_layer[layer_id].float().unsqueeze(0)
+            loss, primary, rank, topk = student_loss_from_runtime(runtime, scores, target)
+            loss_total = loss_total + (loss / 2.0)
+            primary_total += float(primary.detach().cpu())
+            rank_total += float(rank.detach().cpu())
+            topk_total += float(topk.detach().cpu())
+    loss_total.backward()
+    torch.nn.utils.clip_grad_norm_(runtime.student.parameters(), runtime.config.max_grad_norm)
+    runtime.optimizer.step()
+    loss_count = len(runtime.student.layer_indices) * 2
+    return (
+        float(loss_total.detach().cpu()),
+        primary_total / loss_count,
+        rank_total / loss_count,
+        topk_total / loss_count,
+    )
+
+
 @torch.no_grad()
 def evaluate(runtime: TrainingRuntime, val_files: list[Path]) -> float | None:
     if not val_files:
@@ -213,6 +259,8 @@ def evaluate_one_file(runtime: TrainingRuntime, path: Path) -> float:
     hidden_states = compute_prompt_hidden_states(runtime, rec["prompt_input_ids"])
     prompt_indices = rec["prompt_token_indices"].to(runtime.config.device)
     question_indices = rec["question_token_indices"].to(runtime.config.device)
+    if runtime.config.target_mode == "attention_delta":
+        return evaluate_one_file_attention_delta(runtime, rec, hidden_states, prompt_indices, question_indices)
     teacher_targets = teacher_targets_from_record(rec, runtime.config).to(runtime.config.device)
     target_count = int(teacher_targets.shape[0])
     file_loss = 0.0
@@ -227,6 +275,35 @@ def evaluate_one_file(runtime: TrainingRuntime, path: Path) -> float:
             target = teacher_target[layer_id].float().unsqueeze(0)
             loss, _mse, _rank, _topk = student_loss_from_runtime(runtime, scores, target)
             file_loss += float((loss / target_count).detach().cpu())
+    return file_loss
+
+
+def evaluate_one_file_attention_delta(
+    runtime: TrainingRuntime,
+    rec: dict,
+    hidden_states: tuple[torch.Tensor, ...],
+    prompt_indices: torch.Tensor,
+    question_indices: torch.Tensor,
+) -> float:
+    attention_target = rec["teacher_norm"].float().to(runtime.config.device)
+    delta_target = rec["delta_norm"].float().to(runtime.config.device)
+    file_loss = 0.0
+    for layer_id in runtime.student.layer_indices:
+        hidden = hidden_states[layer_id].float()
+        for head, target_by_layer in (
+            ("attention", attention_target),
+            ("delta", delta_target),
+        ):
+            scores = runtime.student.forward_layer(
+                layer_id,
+                hidden,
+                prompt_indices,
+                question_indices,
+                head=head,
+            )
+            target = target_by_layer[layer_id].float().unsqueeze(0)
+            loss, _primary, _rank, _topk = student_loss_from_runtime(runtime, scores, target)
+            file_loss += float((loss / 2.0).detach().cpu())
     return file_loss
 
 

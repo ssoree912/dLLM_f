@@ -63,6 +63,7 @@ def parse_train_config() -> TrainConfig:
             "drift",
             "hybrid_mask",
             "delta",
+            "attention_delta",
         ],
         default="score",
     )
