@@ -9,6 +9,11 @@ PHYSICAL_GPU=2
 export CUDA_VISIBLE_DEVICES="${PHYSICAL_GPU}"
 export MASKKV_ENABLED=0
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+export NUMEXPR_NUM_THREADS=1
+export TOKENIZERS_PARALLELISM=false
 
 PYTHON=/opt/conda/envs/dllm/bin/python
 MODEL=/workspace/dllm/model/LLaDA-8B-Instruct
@@ -16,9 +21,10 @@ SOURCE_ROOT=results/budget/prompt_source_300each_11dataset_20260818
 OUTPUT_ROOT=results/budget/offline_commit_attention_delta_teacher_300each_chat_notopk_20260818
 LOG_ROOT=results/budget/teacher_run_logs
 LOG_FILE="${LOG_ROOT}/commit_attention_delta_300each_chat_notopk_20260818.log"
-CHUNK_SIZE="${CHUNK_SIZE:-20}"
-CHUNK_TIMEOUT_SECONDS="${CHUNK_TIMEOUT_SECONDS:-1800}"
+CHUNK_SIZE="${CHUNK_SIZE:-5}"
+CHUNK_TIMEOUT_SECONDS="${CHUNK_TIMEOUT_SECONDS:-300}"
 MAX_STALLED_RETRIES="${MAX_STALLED_RETRIES:-3}"
+CPU_AFFINITY="${CPU_AFFINITY:-0-7}"
 
 DATASETS=(
   2wikimultihopqa_train
@@ -88,11 +94,13 @@ mkdir -p "${OUTPUT_ROOT}" "${LOG_ROOT}"
 echo "[extract] commit-time continuous Attention + cumulative Delta in one trajectory"
 echo "[extract] chat_template=true active_top_k=0 aggregation=max samples=11x300"
 echo "[extract] chunk_size=${CHUNK_SIZE} timeout=${CHUNK_TIMEOUT_SECONDS}s resume=true"
+echo "[extract] cpu_affinity=${CPU_AFFINITY} cpu_threads=1"
 
 run_chunk() {
   local dataset=$1
   local target=$2
   timeout --signal=TERM --kill-after=30s "${CHUNK_TIMEOUT_SECONDS}s" \
+    taskset --cpu-list "${CPU_AFFINITY}" \
     "${PYTHON}" -m dllm_cache.budget.extract_offline_hybrid_from_shards \
       --model "${MODEL}" \
       --source-root "${SOURCE_ROOT}" \
